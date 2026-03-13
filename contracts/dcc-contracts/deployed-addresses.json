@@ -1,0 +1,10 @@
+{
+  "PairRegistry": "3DhUAQtPAVrUukobwVw4SgujyB3yFX82Qqr",
+  "RiskConfig": "3DX3TjyzFcVGZzMJP3TgL1pTgpwGtjgf6kG",
+  "SyntheticAssetFactory": "3Dkd7yNsoU1oj4tp6zaYGWyaHbRBPtZn8VB",
+  "SyntheticVault": "3DZhXEqSzqxkrcGjbXQm8QTNw4tHSM9YaZ6",
+  "SyntheticOracleAdapter": "3Dj6o4E6xS6Uit2Unw4M8YxPei5tCjaGDJD",
+  "SyntheticLiquidationEngine": "3DTh6sCdSFcy9SFLsK4hu8ZTVSpQ4hKqY5p",
+  "SyntheticAMM": "3DehXxU6pXMNePVmUgGTZFthgb5V3f3qaYo",
+  "ExecutionEscrow": "3DPHeU6Bh7HYUTojDrXDst3Dp1H5R8xyQF6"
+}

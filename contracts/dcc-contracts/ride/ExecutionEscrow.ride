@@ -1,0 +1,822 @@
+# ===========================================================================
+# ExecutionEscrow.ride — On-Chain Settlement Safety Vault
+# ===========================================================================
+#
+# DecentralChain (Waves-compatible) smart contract implementing the execution
+# escrow for the DCC Global Liquidity Router.
+#
+# This contract secures user funds during cross-chain and relayer-backed
+# route execution. It guarantees:
+#   - funds never lost due to relayer/venue failure
+#   - timeout-based automatic refund eligibility
+#   - replay protection via monotonic user nonces
+#   - mutual exclusion: finalize XOR refund (never both)
+#   - strict state machine enforcement
+#
+# SUPPORTED EXECUTION MODES:
+#   1. LOCAL      — DCC-only swap, no relayer
+#   2. TELEPORT   — DCC local + relayer external leg
+#   3. SYNTHETIC   — mint synthetic on DCC
+#   4. REDEEMABLE  — mint redeemable synthetic
+#
+# STATE MACHINE:
+#   created → funds_locked → route_locked → local_leg_executed
+#   route_locked → external_leg_pending → external_leg_confirmed
+#   external_leg_confirmed → delivery_pending → completed
+#   external_leg_pending → partially_completed
+#   Any non-terminal → failed | expired
+#   failed | expired | partially_completed → refunded
+#
+# ===========================================================================
+
+{-# STDLIB_VERSION 5 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+# ===========================================================================
+# CONSTANTS
+# ===========================================================================
+
+let SEPARATOR = "__"
+
+# Status codes (stored as integers for gas efficiency)
+let STATUS_CREATED              = 0
+let STATUS_FUNDS_LOCKED         = 1
+let STATUS_ROUTE_LOCKED         = 2
+let STATUS_LOCAL_LEG_EXECUTED   = 3
+let STATUS_EXTERNAL_LEG_PENDING = 4
+let STATUS_EXTERNAL_LEG_CONFIRMED = 5
+let STATUS_DELIVERY_PENDING     = 6
+let STATUS_COMPLETED            = 7
+let STATUS_PARTIALLY_COMPLETED  = 8
+let STATUS_FAILED               = 9
+let STATUS_REFUNDED             = 10
+let STATUS_EXPIRED              = 11
+
+# Execution modes
+let MODE_LOCAL       = 0
+let MODE_TELEPORT    = 1
+let MODE_SYNTHETIC   = 2
+let MODE_REDEEMABLE  = 3
+
+# Terminal states — no further transitions allowed
+func isTerminal(status: Int) = {
+  status == STATUS_COMPLETED ||
+  status == STATUS_REFUNDED
+}
+
+# Refundable states — eligible for refund flow
+func isRefundable(status: Int) = {
+  status == STATUS_FAILED ||
+  status == STATUS_EXPIRED ||
+  status == STATUS_PARTIALLY_COMPLETED
+}
+
+# ===========================================================================
+# KEY HELPERS
+# ===========================================================================
+
+func keyExecutionUser(execId: String)            = "execution:" + execId + ":user"
+func keyExecutionPair(execId: String)            = "execution:" + execId + ":pair"
+func keyExecutionAmountIn(execId: String)        = "execution:" + execId + ":amountIn"
+func keyExecutionAmountOutExpected(execId: String) = "execution:" + execId + ":amountOutExpected"
+func keyExecutionMinAmountOut(execId: String)    = "execution:" + execId + ":minAmountOut"
+func keyExecutionStatus(execId: String)          = "execution:" + execId + ":status"
+func keyExecutionRouteHash(execId: String)       = "execution:" + execId + ":routeHash"
+func keyExecutionExpiresAt(execId: String)       = "execution:" + execId + ":expiresAt"
+func keyExecutionRelayer(execId: String)         = "execution:" + execId + ":relayer"
+func keyExecutionAssetIn(execId: String)         = "execution:" + execId + ":assetIn"
+func keyExecutionAssetOut(execId: String)        = "execution:" + execId + ":assetOut"
+func keyExecutionCreatedAt(execId: String)       = "execution:" + execId + ":createdAt"
+func keyExecutionNonce(execId: String)           = "execution:" + execId + ":nonce"
+func keyExecutionMode(execId: String)            = "execution:" + execId + ":mode"
+func keyExecutionActualAmountOut(execId: String) = "execution:" + execId + ":actualAmountOut"
+func keyExecutionRefundAmount(execId: String)    = "execution:" + execId + ":refundAmount"
+func keyExecutionSettledAt(execId: String)       = "execution:" + execId + ":settledAt"
+func keyExecutionProofData(execId: String)       = "execution:" + execId + ":proofData"
+
+func keyUserNonce(user: String)                  = "user:" + user + ":nonce"
+
+func keyExecutionCount()                         = "global:executionCount"
+func keyActiveExecutions()                       = "global:activeExecutions"
+func keyFailedExecutions()                       = "global:failedExecutions"
+func keyCompletedExecutions()                    = "global:completedExecutions"
+func keyRefundedExecutions()                     = "global:refundedExecutions"
+
+func keyPaused()                                 = "global:paused"
+
+func keyRelayerAllowed(relayerId: String)        = "relayer:" + relayerId + ":allowed"
+
+func keySettlementRole(addr: String)             = "role:settlement:" + addr
+func keyOperatorRole(addr: String)               = "role:operator:" + addr
+
+# ===========================================================================
+# HELPER FUNCTIONS
+# ===========================================================================
+
+func getIntOrDefault(key: String, default: Int) = {
+  match getInteger(this, key) {
+    case v: Int => v
+    case _ => default
+  }
+}
+
+func getStrOrDefault(key: String, default: String) = {
+  match getString(this, key) {
+    case v: String => v
+    case _ => default
+  }
+}
+
+func getBoolOrDefault(key: String, default: Boolean) = {
+  match getBoolean(this, key) {
+    case v: Boolean => v
+    case _ => default
+  }
+}
+
+func requireStatus(execId: String, expected: Int) = {
+  let current = getIntOrDefault(keyExecutionStatus(execId), -1)
+  if (current != expected)
+    then throw("Invalid status: expected " + toString(expected) + " got " + toString(current))
+    else true
+}
+
+func requireNotTerminal(execId: String) = {
+  let status = getIntOrDefault(keyExecutionStatus(execId), -1)
+  if (isTerminal(status))
+    then throw("Execution is in terminal state: " + toString(status))
+    else true
+}
+
+func requireCallerIsUser(execId: String, caller: String) = {
+  let user = getStrOrDefault(keyExecutionUser(execId), "")
+  if (user != caller)
+    then throw("Caller is not the execution owner")
+    else true
+}
+
+func requireCallerIsRelayer(execId: String, caller: String) = {
+  let relayer = getStrOrDefault(keyExecutionRelayer(execId), "")
+  if (relayer != caller)
+    then throw("Caller is not the assigned relayer")
+    else true
+}
+
+func requireRelayerAllowed(relayerId: String) = {
+  if (!getBoolOrDefault(keyRelayerAllowed(relayerId), false))
+    then throw("Relayer not in allowlist: " + relayerId)
+    else true
+}
+
+func requireSettlementRole(caller: String) = {
+  if (!getBoolOrDefault(keySettlementRole(caller), false))
+    then throw("Caller does not have SETTLEMENT_ROLE")
+    else true
+}
+
+func requireOperatorRole(caller: String) = {
+  if (!getBoolOrDefault(keyOperatorRole(caller), false))
+    then throw("Caller does not have OPERATOR_ROLE")
+    else true
+}
+
+func requireNotPaused() = {
+  if (getBoolOrDefault(keyPaused(), false))
+    then throw("Protocol is paused")
+    else true
+}
+
+func requireExecutionExists(execId: String) = {
+  let user = getStrOrDefault(keyExecutionUser(execId), "")
+  if (user == "")
+    then throw("Execution does not exist: " + execId)
+    else true
+}
+
+func requireExpired(execId: String) = {
+  let expiresAt = getIntOrDefault(keyExecutionExpiresAt(execId), 0)
+  if (lastBlock.timestamp < expiresAt)
+    then throw("Execution has not expired yet")
+    else true
+}
+
+func requireNotExpired(execId: String) = {
+  let expiresAt = getIntOrDefault(keyExecutionExpiresAt(execId), 0)
+  if (lastBlock.timestamp >= expiresAt)
+    then throw("Execution has expired")
+    else true
+}
+
+# ===========================================================================
+# @Callable — createExecutionIntent
+# ===========================================================================
+#
+# Creates a new escrow entry and locks user funds.
+# User must attach payment matching inputAmount.
+#
+# Transitions: (none) → funds_locked
+#
+# Replay protection: nonce must equal user's current nonce + 1
+
+@Callable(i)
+func createExecutionIntent(
+  executionId: String,
+  pairId: String,
+  inputAsset: String,
+  outputAsset: String,
+  expectedAmountOut: Int,
+  minAmountOut: Int,
+  routePlanHash: String,
+  executionMode: Int,
+  relayerId: String,
+  expiresAt: Int,
+  nonce: Int
+) = {
+  strict notPaused = requireNotPaused()
+
+  let caller = toBase58String(i.caller.bytes)
+
+  # Validate execution doesn't already exist (replay protection)
+  let existingUser = getStrOrDefault(keyExecutionUser(executionId), "")
+  if (existingUser != "")
+    then throw("Execution already exists: " + executionId)
+    else {
+
+  # Validate nonce: must be current + 1
+  let currentNonce = getIntOrDefault(keyUserNonce(caller), 0)
+  if (nonce != currentNonce + 1)
+    then throw("Invalid nonce: expected " + toString(currentNonce + 1) + " got " + toString(nonce))
+    else {
+
+  # Validate payment attached
+  if (size(i.payments) != 1)
+    then throw("Exactly one payment required")
+    else {
+
+  let payment = i.payments[0]
+  let amountIn = payment.amount
+
+  if (amountIn <= 0)
+    then throw("Payment must be positive")
+    else {
+
+  # Validate expiry is in the future
+  if (expiresAt <= lastBlock.timestamp)
+    then throw("Expiry must be in the future")
+    else {
+
+  # Validate execution mode
+  if (executionMode < 0 || executionMode > 3)
+    then throw("Invalid execution mode: " + toString(executionMode))
+    else {
+
+  # Validate expected amounts
+  if (expectedAmountOut <= 0 || minAmountOut <= 0)
+    then throw("Expected/min amount out must be positive")
+    else {
+
+  if (minAmountOut > expectedAmountOut)
+    then throw("minAmountOut cannot exceed expectedAmountOut")
+    else {
+
+  # Validate relayer is allowed (for non-local modes)
+  strict relayerOk = if (executionMode != MODE_LOCAL)
+    then requireRelayerAllowed(relayerId)
+    else true
+
+  let execCount = getIntOrDefault(keyExecutionCount(), 0)
+  let activeCount = getIntOrDefault(keyActiveExecutions(), 0)
+
+  [
+    # Store execution data
+    StringEntry(keyExecutionUser(executionId), caller),
+    StringEntry(keyExecutionPair(executionId), pairId),
+    IntegerEntry(keyExecutionAmountIn(executionId), amountIn),
+    IntegerEntry(keyExecutionAmountOutExpected(executionId), expectedAmountOut),
+    IntegerEntry(keyExecutionMinAmountOut(executionId), minAmountOut),
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_FUNDS_LOCKED),
+    StringEntry(keyExecutionRouteHash(executionId), routePlanHash),
+    IntegerEntry(keyExecutionExpiresAt(executionId), expiresAt),
+    StringEntry(keyExecutionRelayer(executionId), relayerId),
+    StringEntry(keyExecutionAssetIn(executionId), inputAsset),
+    StringEntry(keyExecutionAssetOut(executionId), outputAsset),
+    IntegerEntry(keyExecutionCreatedAt(executionId), lastBlock.timestamp),
+    IntegerEntry(keyExecutionNonce(executionId), nonce),
+    IntegerEntry(keyExecutionMode(executionId), executionMode),
+
+    # Update user nonce
+    IntegerEntry(keyUserNonce(caller), nonce),
+
+    # Update global counters
+    IntegerEntry(keyExecutionCount(), execCount + 1),
+    IntegerEntry(keyActiveExecutions(), activeCount + 1)
+  ]
+
+  }}}}}}}}
+}
+
+# ===========================================================================
+# @Callable — lockRoute
+# ===========================================================================
+#
+# Called by router after route confirmation.
+# Validates route hash matches what was submitted.
+#
+# Transitions: funds_locked → route_locked
+
+@Callable(i)
+func lockRoute(executionId: String, routeHash: String) = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireSettlementRole(caller)
+  strict exists = requireExecutionExists(executionId)
+  strict status = requireStatus(executionId, STATUS_FUNDS_LOCKED)
+  strict notExpired = requireNotExpired(executionId)
+
+  let storedHash = getStrOrDefault(keyExecutionRouteHash(executionId), "")
+  if (routeHash != storedHash)
+    then throw("Route hash mismatch")
+    else {
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_ROUTE_LOCKED)
+  ]
+
+  }
+}
+
+# ===========================================================================
+# @Callable — markLocalExecution
+# ===========================================================================
+#
+# Used when a local DCC swap has been executed.
+#
+# Transitions: route_locked → local_leg_executed
+
+@Callable(i)
+func markLocalExecution(executionId: String, localAmountOut: Int) = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireSettlementRole(caller)
+  strict exists = requireExecutionExists(executionId)
+  strict status = requireStatus(executionId, STATUS_ROUTE_LOCKED)
+  strict notExpired = requireNotExpired(executionId)
+
+  if (localAmountOut <= 0)
+    then throw("Local amount out must be positive")
+    else {
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_LOCAL_LEG_EXECUTED),
+    IntegerEntry(keyExecutionActualAmountOut(executionId), localAmountOut)
+  ]
+
+  }
+}
+
+# ===========================================================================
+# @Callable — markExternalPending
+# ===========================================================================
+#
+# Marks execution as awaiting external leg completion.
+#
+# Transitions: route_locked | local_leg_executed → external_leg_pending
+
+@Callable(i)
+func markExternalPending(executionId: String) = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireSettlementRole(caller)
+  strict exists = requireExecutionExists(executionId)
+  strict notExpired = requireNotExpired(executionId)
+
+  let currentStatus = getIntOrDefault(keyExecutionStatus(executionId), -1)
+  if (currentStatus != STATUS_ROUTE_LOCKED && currentStatus != STATUS_LOCAL_LEG_EXECUTED)
+    then throw("Invalid transition to external_leg_pending from status " + toString(currentStatus))
+    else {
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_EXTERNAL_LEG_PENDING)
+  ]
+
+  }
+}
+
+# ===========================================================================
+# @Callable — confirmExternalExecution
+# ===========================================================================
+#
+# Called by the assigned relayer to confirm external execution.
+# Relayer provides: actual amount out + proof data (tx hash / signature).
+#
+# Transitions: external_leg_pending → external_leg_confirmed
+#
+# Security:
+#   - Only the assigned relayer can call this
+#   - Relayer must be in the allowlist
+#   - Execution must not be expired
+#   - Actual amount must meet minimum
+
+@Callable(i)
+func confirmExternalExecution(
+  executionId: String,
+  actualAmountOut: Int,
+  proofData: String
+) = {
+  let caller = toBase58String(i.caller.bytes)
+  strict relayerOk = requireCallerIsRelayer(executionId, caller)
+  strict allowed = requireRelayerAllowed(caller)
+  strict exists = requireExecutionExists(executionId)
+  strict status = requireStatus(executionId, STATUS_EXTERNAL_LEG_PENDING)
+  strict notExpired = requireNotExpired(executionId)
+
+  if (actualAmountOut <= 0)
+    then throw("Actual amount out must be positive")
+    else {
+
+  let minAmount = getIntOrDefault(keyExecutionMinAmountOut(executionId), 0)
+  if (actualAmountOut < minAmount)
+    then throw("Amount below minimum: " + toString(actualAmountOut) + " < " + toString(minAmount))
+    else {
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_EXTERNAL_LEG_CONFIRMED),
+    IntegerEntry(keyExecutionActualAmountOut(executionId), actualAmountOut),
+    StringEntry(keyExecutionProofData(executionId), proofData)
+  ]
+
+  }}
+}
+
+# ===========================================================================
+# @Callable — markDeliveryPending
+# ===========================================================================
+#
+# Called after confirmation, before final delivery.
+#
+# Transitions: external_leg_confirmed | local_leg_executed → delivery_pending
+
+@Callable(i)
+func markDeliveryPending(executionId: String) = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireSettlementRole(caller)
+  strict exists = requireExecutionExists(executionId)
+
+  let currentStatus = getIntOrDefault(keyExecutionStatus(executionId), -1)
+  if (currentStatus != STATUS_EXTERNAL_LEG_CONFIRMED && currentStatus != STATUS_LOCAL_LEG_EXECUTED)
+    then throw("Invalid transition to delivery_pending from status " + toString(currentStatus))
+    else {
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_DELIVERY_PENDING)
+  ]
+
+  }
+}
+
+# ===========================================================================
+# @Callable — completeExecution
+# ===========================================================================
+#
+# Final step: transfers output assets to user, marks execution complete.
+#
+# Transitions: delivery_pending → completed
+#
+# This is the ONLY path through which escrowed funds leave as settlement.
+# Mutual exclusion with refund is enforced by the state machine.
+
+@Callable(i)
+func completeExecution(executionId: String, outputAmount: Int) = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireSettlementRole(caller)
+  strict exists = requireExecutionExists(executionId)
+  strict status = requireStatus(executionId, STATUS_DELIVERY_PENDING)
+
+  if (outputAmount <= 0)
+    then throw("Output amount must be positive")
+    else {
+
+  let minAmount = getIntOrDefault(keyExecutionMinAmountOut(executionId), 0)
+  if (outputAmount < minAmount)
+    then throw("Output below minimum: " + toString(outputAmount) + " < " + toString(minAmount))
+    else {
+
+  let activeCount = getIntOrDefault(keyActiveExecutions(), 0)
+  let completedCount = getIntOrDefault(keyCompletedExecutions(), 0)
+  let userAddr = getStrOrDefault(keyExecutionUser(executionId), "")
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_COMPLETED),
+    IntegerEntry(keyExecutionActualAmountOut(executionId), outputAmount),
+    IntegerEntry(keyExecutionSettledAt(executionId), lastBlock.timestamp),
+    IntegerEntry(keyActiveExecutions(), activeCount - 1),
+    IntegerEntry(keyCompletedExecutions(), completedCount + 1),
+    ScriptTransfer(addressFromStringValue(userAddr), outputAmount, unit)
+  ]
+
+  }}
+}
+
+# ===========================================================================
+# @Callable — partialFill
+# ===========================================================================
+#
+# Used when external execution partially fills.
+# Delivers partial output to user, marks for remaining refund.
+#
+# Transitions: external_leg_pending | external_leg_confirmed → partially_completed
+#
+# After this, refundExecution() must be called to return remaining input.
+
+@Callable(i)
+func partialFill(
+  executionId: String,
+  partialAmountOut: Int,
+  proofData: String
+) = {
+  let caller = toBase58String(i.caller.bytes)
+
+  # Either the assigned relayer or settlement role
+  let relayer = getStrOrDefault(keyExecutionRelayer(executionId), "")
+  let isRelayer = (caller == relayer)
+  let isSettlement = getBoolOrDefault(keySettlementRole(caller), false)
+  if (!isRelayer && !isSettlement)
+    then throw("Caller is not relayer or settlement role")
+    else {
+
+  strict exists = requireExecutionExists(executionId)
+
+  let currentStatus = getIntOrDefault(keyExecutionStatus(executionId), -1)
+  if (currentStatus != STATUS_EXTERNAL_LEG_PENDING && currentStatus != STATUS_EXTERNAL_LEG_CONFIRMED)
+    then throw("Invalid transition to partially_completed from status " + toString(currentStatus))
+    else {
+
+  if (partialAmountOut <= 0)
+    then throw("Partial amount out must be positive")
+    else {
+
+  let amountIn = getIntOrDefault(keyExecutionAmountIn(executionId), 0)
+  let expectedOut = getIntOrDefault(keyExecutionAmountOutExpected(executionId), 0)
+
+  # Calculate proportional refund of input
+  # refundAmount = amountIn * (1 - partialAmountOut / expectedOut)
+  let filledPortion = fraction(amountIn, partialAmountOut, expectedOut)
+  let refundAmount = amountIn - filledPortion
+  let userAddr = getStrOrDefault(keyExecutionUser(executionId), "")
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_PARTIALLY_COMPLETED),
+    IntegerEntry(keyExecutionActualAmountOut(executionId), partialAmountOut),
+    IntegerEntry(keyExecutionRefundAmount(executionId), refundAmount),
+    StringEntry(keyExecutionProofData(executionId), proofData),
+    # Deliver partial output to user immediately
+    ScriptTransfer(addressFromStringValue(userAddr), partialAmountOut, unit)
+  ]
+
+  }}}
+}
+
+# ===========================================================================
+# @Callable — failExecution
+# ===========================================================================
+#
+# Called when execution fails at any point.
+# Marks execution as failed, enabling refund.
+#
+# Transitions: any non-terminal → failed
+
+@Callable(i)
+func failExecution(executionId: String, reason: String) = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireSettlementRole(caller)
+  strict exists = requireExecutionExists(executionId)
+  strict notTerminal = requireNotTerminal(executionId)
+
+  let activeCount = getIntOrDefault(keyActiveExecutions(), 0)
+  let failedCount = getIntOrDefault(keyFailedExecutions(), 0)
+  let amountIn = getIntOrDefault(keyExecutionAmountIn(executionId), 0)
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_FAILED),
+    IntegerEntry(keyExecutionRefundAmount(executionId), amountIn),
+    IntegerEntry(keyActiveExecutions(), activeCount - 1),
+    IntegerEntry(keyFailedExecutions(), failedCount + 1)
+  ]
+}
+
+# ===========================================================================
+# @Callable — refundExecution
+# ===========================================================================
+#
+# Transfers input funds (or remaining input) back to user.
+# Can only be called after fail, expire, or partial fill.
+#
+# Transitions: failed | expired | partially_completed → refunded
+#
+# Mutual exclusion with completeExecution enforced by state check.
+
+@Callable(i)
+func refundExecution(executionId: String) = {
+  strict exists = requireExecutionExists(executionId)
+
+  let currentStatus = getIntOrDefault(keyExecutionStatus(executionId), -1)
+  if (!isRefundable(currentStatus))
+    then throw("Execution is not in a refundable state: " + toString(currentStatus))
+    else {
+
+  let caller = toBase58String(i.caller.bytes)
+  let user = getStrOrDefault(keyExecutionUser(executionId), "")
+  let isOperator = getBoolOrDefault(keyOperatorRole(caller), false)
+
+  # Only the original user or an operator can trigger refund
+  if (caller != user && !isOperator)
+    then throw("Only the execution owner or operator can refund")
+    else {
+
+  let refundAmount = getIntOrDefault(keyExecutionRefundAmount(executionId), 0)
+  let amountIn = getIntOrDefault(keyExecutionAmountIn(executionId), 0)
+
+  # For failed/expired, refund full amountIn; for partial, use computed refundAmount
+  let actualRefund = if (refundAmount > 0) then refundAmount else amountIn
+  if (actualRefund <= 0)
+    then throw("No funds to refund")
+    else {
+
+  let activeCount = getIntOrDefault(keyActiveExecutions(), 0)
+  let refundedCount = getIntOrDefault(keyRefundedExecutions(), 0)
+
+  # Only decrement active if transitioning from a non-partially-completed state
+  # (partial fill already decremented via the execution path)
+  let newActiveCount = if (currentStatus == STATUS_PARTIALLY_COMPLETED)
+    then activeCount
+    else activeCount - 1
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_REFUNDED),
+    IntegerEntry(keyExecutionSettledAt(executionId), lastBlock.timestamp),
+    IntegerEntry(keyActiveExecutions(), if (newActiveCount >= 0) then newActiveCount else 0),
+    IntegerEntry(keyRefundedExecutions(), refundedCount + 1),
+    ScriptTransfer(addressFromStringValue(user), actualRefund, unit)
+  ]
+
+  }}}
+}
+
+# ===========================================================================
+# @Callable — expireExecution
+# ===========================================================================
+#
+# Anyone can call this after the execution has timed out.
+# Marks the execution as expired, enabling refund.
+#
+# Transitions: any non-terminal → expired
+
+@Callable(i)
+func expireExecution(executionId: String) = {
+  strict exists = requireExecutionExists(executionId)
+  strict notTerminal = requireNotTerminal(executionId)
+  strict expired = requireExpired(executionId)
+
+  let amountIn = getIntOrDefault(keyExecutionAmountIn(executionId), 0)
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_EXPIRED),
+    IntegerEntry(keyExecutionRefundAmount(executionId), amountIn)
+  ]
+}
+
+# ===========================================================================
+# ADMIN FUNCTIONS
+# ===========================================================================
+
+# Set relayer allowlist entry
+@Callable(i)
+func setRelayerAllowed(relayerId: String, allowed: Boolean) = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireOperatorRole(caller)
+
+  [
+    BooleanEntry(keyRelayerAllowed(relayerId), allowed)
+  ]
+}
+
+# Grant settlement role
+@Callable(i)
+func grantSettlementRole(addr: String) = {
+  # Only contract owner can grant roles
+  if (i.caller != this) then throw("Only contract owner") else {
+  [
+    BooleanEntry(keySettlementRole(addr), true)
+  ]
+  }
+}
+
+# Revoke settlement role
+@Callable(i)
+func revokeSettlementRole(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner") else {
+  [
+    BooleanEntry(keySettlementRole(addr), false)
+  ]
+  }
+}
+
+# Grant operator role
+@Callable(i)
+func grantOperatorRole(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner") else {
+  [
+    BooleanEntry(keyOperatorRole(addr), true)
+  ]
+  }
+}
+
+# Revoke operator role
+@Callable(i)
+func revokeOperatorRole(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner") else {
+  [
+    BooleanEntry(keyOperatorRole(addr), false)
+  ]
+  }
+}
+
+# Emergency pause (operator only)
+@Callable(i)
+func pause() = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireOperatorRole(caller)
+  [
+    BooleanEntry(keyPaused(), true)
+  ]
+}
+
+# Unpause (operator only)
+@Callable(i)
+func unpause() = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireOperatorRole(caller)
+  [
+    BooleanEntry(keyPaused(), false)
+  ]
+}
+
+# ===========================================================================
+# @Callable — forceRefund (emergency operator refund)
+# ===========================================================================
+#
+# Operator can force refund for failed/expired executions.
+# This bypasses the normal user-initiated refund flow.
+
+@Callable(i)
+func forceRefund(executionId: String) = {
+  let caller = toBase58String(i.caller.bytes)
+  strict role = requireOperatorRole(caller)
+  strict exists = requireExecutionExists(executionId)
+
+  let currentStatus = getIntOrDefault(keyExecutionStatus(executionId), -1)
+  if (!isRefundable(currentStatus) && currentStatus != STATUS_EXPIRED)
+    then throw("Cannot force refund: status " + toString(currentStatus))
+    else {
+
+  let user = getStrOrDefault(keyExecutionUser(executionId), "")
+  let amountIn = getIntOrDefault(keyExecutionAmountIn(executionId), 0)
+  let refundAmount = getIntOrDefault(keyExecutionRefundAmount(executionId), 0)
+  let actualRefund = if (refundAmount > 0) then refundAmount else amountIn
+  let refundedCount = getIntOrDefault(keyRefundedExecutions(), 0)
+  let activeCount = getIntOrDefault(keyActiveExecutions(), 0)
+
+  [
+    IntegerEntry(keyExecutionStatus(executionId), STATUS_REFUNDED),
+    IntegerEntry(keyExecutionSettledAt(executionId), lastBlock.timestamp),
+    IntegerEntry(keyRefundedExecutions(), refundedCount + 1),
+    IntegerEntry(keyActiveExecutions(), if (activeCount > 0) then activeCount - 1 else 0),
+    ScriptTransfer(addressFromStringValue(user), actualRefund, unit)
+  ]
+
+  }
+}
+
+# ===========================================================================
+# READ FUNCTIONS (via @Callable returning data entries)
+# ===========================================================================
+
+@Callable(i)
+func getExecutionStatus(executionId: String) = {
+  let status = getIntOrDefault(keyExecutionStatus(executionId), -1)
+  ([], status)
+}
+
+@Callable(i)
+func getUserNonce(userAddress: String) = {
+  let nonce = getIntOrDefault(keyUserNonce(userAddress), 0)
+  ([], nonce)
+}
+
+@Callable(i)
+func getGlobalStats() = {
+  let total = getIntOrDefault(keyExecutionCount(), 0)
+  let active = getIntOrDefault(keyActiveExecutions(), 0)
+  let failed = getIntOrDefault(keyFailedExecutions(), 0)
+  let completed = getIntOrDefault(keyCompletedExecutions(), 0)
+  let refunded = getIntOrDefault(keyRefundedExecutions(), 0)
+  ([], (total, active, failed, completed, refunded))
+}

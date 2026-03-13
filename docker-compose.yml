@@ -1,0 +1,421 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dcc
+      POSTGRES_PASSWORD: dcc_dev_password
+      POSTGRES_DB: dcc_liquidity
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dcc"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================================
+  # Operator Backend Services
+  # ============================================================================
+
+  operator-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: operator-api
+    ports:
+      - "3100:3100"
+    environment:
+      PORT: 3100
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      NODE_ENV: development
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  execution-tracker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: execution-tracker
+    ports:
+      - "3101:3101"
+    environment:
+      PORT: 3101
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  relayer-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: relayer-monitor
+    ports:
+      - "3102:3102"
+    environment:
+      PORT: 3102
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  venue-health-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: venue-health-monitor
+    ports:
+      - "3103:3103"
+    environment:
+      PORT: 3103
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+      JUPITER_API_URL: https://quote-api.jup.ag/v6
+      RAYDIUM_API_URL: https://api-v3.raydium.io
+      UNISWAP_API_URL: https://api.uniswap.org/v2
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  market-health-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: market-health-monitor
+    ports:
+      - "3104:3104"
+    environment:
+      PORT: 3104
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  synthetic-risk-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: synthetic-risk-monitor
+    ports:
+      - "3105:3105"
+    environment:
+      PORT: 3105
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+      DCC_NODE_URL: http://localhost:4000
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  alert-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: alert-engine
+    ports:
+      - "3106:3106"
+    environment:
+      PORT: 3106
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  protocol-control:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: protocol-control
+    ports:
+      - "3107:3107"
+    environment:
+      PORT: 3107
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+      DCC_NODE_URL: http://localhost:4000
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ============================================================================
+  # Relayer + Hedging Engine Services
+  # ============================================================================
+
+  market-data-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: market-data-service
+    ports:
+      - "3210:3210"
+    environment:
+      PORT: 3210
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  quote-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: quote-engine
+    ports:
+      - "3211:3211"
+    environment:
+      PORT: 3211
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      MARKET_DATA_URL: http://market-data-service:3210
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      market-data-service:
+        condition: service_started
+    restart: unless-stopped
+
+  router-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: router-service
+    ports:
+      - "3212:3212"
+    environment:
+      PORT: 3212
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      QUOTE_ENGINE_URL: http://quote-engine:3211
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      quote-engine:
+        condition: service_started
+    restart: unless-stopped
+
+  execution-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: execution-service
+    ports:
+      - "3213:3213"
+    environment:
+      PORT: 3213
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      ROUTER_SERVICE_URL: http://router-service:3212
+      RELAYER_SERVICE_URL: http://relayer-service:3200
+      EXECUTION_TRACKER_URL: http://execution-tracker:3101
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      router-service:
+        condition: service_started
+    restart: unless-stopped
+
+  relayer-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: relayer-api
+    ports:
+      - "3200:3200"
+    environment:
+      PORT: 3200
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  relayer-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: relayer-service
+    ports:
+      - "3220:3220"
+    environment:
+      PORT: 3220
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+      DCC_NODE_URL: http://localhost:4000
+      RELAYER_WALLET_ADDRESS: "0x0000000000000000000000000000000000000001"
+      RELAYER_WALLET_KEY_PATH: /dev/null
+      JUPITER_API_URL: https://quote-api.jup.ag/v6
+      UNISWAP_RPC_URL: https://eth-mainnet.public.blastapi.io
+      UNISWAP_QUOTER_ADDRESS: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
+      UNISWAP_ROUTER_ADDRESS: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  execution-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: execution-worker
+    ports:
+      - "3201:3201"
+    environment:
+      PORT: 3201
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+      JUPITER_API_URL: https://quote-api.jup.ag/v6
+      RAYDIUM_API_URL: https://api-v3.raydium.io
+      UNISWAP_RPC_URL: https://eth-mainnet.public.blastapi.io
+      UNISWAP_QUOTER_ADDRESS: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
+      UNISWAP_ROUTER_ADDRESS: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+      RELAYER_WALLET_ADDRESS: "0x0000000000000000000000000000000000000001"
+      RELAYER_WALLET_KEY_PATH: /dev/null
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  inventory-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: inventory-manager
+    ports:
+      - "3202:3202"
+    environment:
+      PORT: 3202
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  hedging-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: hedging-engine
+    ports:
+      - "3203:3203"
+    environment:
+      PORT: 3203
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  reconciliation-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: reconciliation-service
+    ports:
+      - "3204:3204"
+    environment:
+      PORT: 3204
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://dcc:dcc_dev_password@postgres:5432/dcc_liquidity
+      REDIS_URL: redis://redis:6379
+      JUPITER_API_URL: https://quote-api.jup.ag/v6
+      UNISWAP_RPC_URL: https://eth-mainnet.public.blastapi.io
+      UNISWAP_QUOTER_ADDRESS: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
+      UNISWAP_ROUTER_ADDRESS: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  quote-refresher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: quote-refresher
+    ports:
+      - "3205:3205"
+    environment:
+      PORT: 3205
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      REDIS_URL: redis://redis:6379
+      JUPITER_API_URL: https://quote-api.jup.ag/v6
+      RAYDIUM_API_URL: https://api-v3.raydium.io
+      UNISWAP_RPC_URL: https://eth-mainnet.public.blastapi.io
+      UNISWAP_QUOTER_ADDRESS: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
+      UNISWAP_ROUTER_ADDRESS: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

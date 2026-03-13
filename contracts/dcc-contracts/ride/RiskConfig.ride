@@ -1,0 +1,307 @@
+# ===========================================================================
+# RiskConfig.ride — Protocol Risk Parameter Store
+# ===========================================================================
+#
+# Protocol-wide and per-market risk parameters, enforced on-chain.
+# Mirrors to off-chain services for real-time risk monitoring.
+#
+# STORAGE:
+#   risk:global:*              — protocol-wide risk parameters
+#   risk:market:{pairId}:*     — per-market risk overrides
+#   risk:relayer:{relayerId}:* — relayer allowlist + limits
+#
+# ACCESS CONTROL:
+#   RISK_ADMIN_ROLE → setGlobalConfig, setMarketConfig, setRelayerConfig,
+#                     liftEmergencyPause, de-escalate circuit breaker
+#   OPERATOR_ROLE   → triggerEmergencyPause, escalate circuit breaker
+#
+# ===========================================================================
+
+{-# STDLIB_VERSION 5 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+# ===========================================================================
+# CONSTANTS
+# ===========================================================================
+
+let SEPARATOR = "__"
+
+# Circuit breaker levels
+let CB_NONE    = 0
+let CB_SOFT    = 1   # reduced limits
+let CB_HARD    = 2   # new operations blocked
+let CB_HALTED  = 3   # all operations blocked
+
+# Minimum safety floors
+let MIN_STALE_THRESHOLD_MS = 1000
+let MIN_ESCROW_TIMEOUT_MS  = 30000
+
+# ===========================================================================
+# KEY HELPERS
+# ===========================================================================
+
+# Global risk keys
+func keyGlobalMaxRelayerNotional()    = "risk:global:maxRelayerNotional"
+func keyGlobalMaxSynthNotional()      = "risk:global:maxSyntheticNotional"
+func keyGlobalStaleThreshold()        = "risk:global:staleQuoteThresholdMs"
+func keyGlobalDefaultEscrowTimeout()  = "risk:global:defaultEscrowTimeoutMs"
+func keyGlobalMaxEscrowTimeout()      = "risk:global:maxEscrowTimeoutMs"
+func keyGlobalEmergencyPause()        = "risk:global:emergencyPause"
+func keyGlobalCircuitBreaker()        = "risk:global:circuitBreaker"
+
+# Per-market risk keys
+func keyMarketMaxTradeSize(pairId: String)    = "risk:market:" + pairId + ":maxTradeSize"
+func keyMarketMaxDailyVol(pairId: String)     = "risk:market:" + pairId + ":maxDailyVolume"
+func keyMarketMaxOpenExec(pairId: String)     = "risk:market:" + pairId + ":maxOpenExec"
+func keyMarketStaleThresh(pairId: String)     = "risk:market:" + pairId + ":staleThreshMs"
+func keyMarketMaxSlippage(pairId: String)     = "risk:market:" + pairId + ":maxSlippageBps"
+func keyMarketCircuitBreaker(pairId: String)  = "risk:market:" + pairId + ":circuitBreaker"
+
+# Relayer risk keys
+func keyRelayerAllowed(relayerId: String)     = "risk:relayer:" + relayerId + ":allowed"
+func keyRelayerMaxExposure(relayerId: String) = "risk:relayer:" + relayerId + ":maxExposure"
+
+# Score weights
+func keyWeightOutput()     = "risk:global:weight:output"
+func keyWeightFee()        = "risk:global:weight:fee"
+func keyWeightSlippage()   = "risk:global:weight:slippage"
+func keyWeightFreshness()  = "risk:global:weight:freshness"
+func keyWeightSettlement() = "risk:global:weight:settlement"
+
+# Access control
+func keyRiskAdmin(addr: String)  = "riskAdmin:" + addr
+func keyOperator(addr: String)   = "operator:" + addr
+
+# ===========================================================================
+# READ HELPERS
+# ===========================================================================
+
+func isRiskAdmin(addr: String) = {
+  getBoolean(this, keyRiskAdmin(addr)).valueOrElse(false)
+}
+
+func isOperator(addr: String) = {
+  getBoolean(this, keyOperator(addr)).valueOrElse(false)
+}
+
+func isEmergencyPaused() = {
+  getBoolean(this, keyGlobalEmergencyPause()).valueOrElse(false)
+}
+
+func getGlobalCircuitBreaker() = {
+  getInteger(this, keyGlobalCircuitBreaker()).valueOrElse(CB_NONE)
+}
+
+# ===========================================================================
+# VALIDATION HELPERS
+# ===========================================================================
+
+func requireRiskAdmin(caller: Address) = {
+  let callerStr = toBase58String(caller.bytes)
+  if (!isRiskAdmin(callerStr) && caller != this) then
+    throw("Only risk admin or contract owner")
+  else true
+}
+
+func requireOperatorOrAdmin(caller: Address) = {
+  let callerStr = toBase58String(caller.bytes)
+  if (!isOperator(callerStr) && !isRiskAdmin(callerStr) && caller != this) then
+    throw("Only operator/risk admin or contract owner")
+  else true
+}
+
+# ===========================================================================
+# @Callable: setGlobalConfig
+# ===========================================================================
+
+@Callable(i)
+func setGlobalConfig(
+  maxRelayerNotional: Int,
+  maxSyntheticNotional: Int,
+  staleQuoteThresholdMs: Int,
+  defaultEscrowTimeoutMs: Int,
+  maxEscrowTimeoutMs: Int
+) = {
+  strict adminCheck = requireRiskAdmin(i.caller)
+
+  if (staleQuoteThresholdMs < MIN_STALE_THRESHOLD_MS) then
+    throw("staleQuoteThreshold must be >= " + toString(MIN_STALE_THRESHOLD_MS) + "ms")
+  else if (defaultEscrowTimeoutMs < MIN_ESCROW_TIMEOUT_MS) then
+    throw("defaultEscrowTimeout must be >= " + toString(MIN_ESCROW_TIMEOUT_MS) + "ms")
+  else if (maxEscrowTimeoutMs < defaultEscrowTimeoutMs) then
+    throw("maxEscrowTimeout must be >= defaultEscrowTimeout")
+  else {
+    [
+      IntegerEntry(keyGlobalMaxRelayerNotional(), maxRelayerNotional),
+      IntegerEntry(keyGlobalMaxSynthNotional(), maxSyntheticNotional),
+      IntegerEntry(keyGlobalStaleThreshold(), staleQuoteThresholdMs),
+      IntegerEntry(keyGlobalDefaultEscrowTimeout(), defaultEscrowTimeoutMs),
+      IntegerEntry(keyGlobalMaxEscrowTimeout(), maxEscrowTimeoutMs)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: setRouteScoreWeights
+# ===========================================================================
+
+@Callable(i)
+func setRouteScoreWeights(
+  output: Int,
+  fee: Int,
+  slippage: Int,
+  freshness: Int,
+  settlement: Int
+) = {
+  strict adminCheck = requireRiskAdmin(i.caller)
+
+  if (output + fee + slippage + freshness + settlement != 100) then
+    throw("Weights must sum to 100")
+  else {
+    [
+      IntegerEntry(keyWeightOutput(), output),
+      IntegerEntry(keyWeightFee(), fee),
+      IntegerEntry(keyWeightSlippage(), slippage),
+      IntegerEntry(keyWeightFreshness(), freshness),
+      IntegerEntry(keyWeightSettlement(), settlement)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: setMarketConfig
+# ===========================================================================
+
+@Callable(i)
+func setMarketConfig(
+  pairId: String,
+  maxTradeSize: Int,
+  maxDailyVolume: Int,
+  maxOpenExecutions: Int,
+  staleQuoteThresholdMs: Int,
+  maxSlippageBps: Int
+) = {
+  strict adminCheck = requireRiskAdmin(i.caller)
+
+  if (maxTradeSize <= 0) then throw("maxTradeSize must be positive")
+  else if (staleQuoteThresholdMs < MIN_STALE_THRESHOLD_MS) then
+    throw("staleQuoteThreshold must be >= " + toString(MIN_STALE_THRESHOLD_MS) + "ms")
+  else {
+    [
+      IntegerEntry(keyMarketMaxTradeSize(pairId), maxTradeSize),
+      IntegerEntry(keyMarketMaxDailyVol(pairId), maxDailyVolume),
+      IntegerEntry(keyMarketMaxOpenExec(pairId), maxOpenExecutions),
+      IntegerEntry(keyMarketStaleThresh(pairId), staleQuoteThresholdMs),
+      IntegerEntry(keyMarketMaxSlippage(pairId), maxSlippageBps)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: setRelayerConfig
+# ===========================================================================
+
+@Callable(i)
+func setRelayerConfig(relayerId: String, allowed: Boolean, maxExposure: Int) = {
+  strict adminCheck = requireRiskAdmin(i.caller)
+
+  [
+    BooleanEntry(keyRelayerAllowed(relayerId), allowed),
+    IntegerEntry(keyRelayerMaxExposure(relayerId), maxExposure)
+  ]
+}
+
+# ===========================================================================
+# @Callable: triggerEmergencyPause
+# ===========================================================================
+
+@Callable(i)
+func triggerEmergencyPause() = {
+  strict opCheck = requireOperatorOrAdmin(i.caller)
+  [BooleanEntry(keyGlobalEmergencyPause(), true)]
+}
+
+# ===========================================================================
+# @Callable: liftEmergencyPause
+# ===========================================================================
+
+@Callable(i)
+func liftEmergencyPause() = {
+  strict adminCheck = requireRiskAdmin(i.caller)
+  [BooleanEntry(keyGlobalEmergencyPause(), false)]
+}
+
+# ===========================================================================
+# @Callable: setCircuitBreaker
+# ===========================================================================
+
+@Callable(i)
+func setGlobalCircuitBreaker(level: Int) = {
+  if (level < CB_NONE || level > CB_HALTED) then throw("Invalid CB level")
+  else {
+    let callerStr = toBase58String(i.caller.bytes)
+    let currentLevel = getGlobalCircuitBreaker()
+
+    # Operators can only escalate (increase level)
+    # Risk admins can do anything
+    let callerIsAdmin = isRiskAdmin(callerStr) || i.caller == this
+    let callerIsOperator = isOperator(callerStr)
+
+    if (!callerIsAdmin && !callerIsOperator) then throw("Not authorized")
+    else if (!callerIsAdmin && level <= currentLevel) then throw("Operator can only escalate CB level")
+    else {
+      [IntegerEntry(keyGlobalCircuitBreaker(), level)]
+    }
+  }
+}
+
+@Callable(i)
+func setMarketCircuitBreaker(pairId: String, level: Int) = {
+  if (level < CB_NONE || level > CB_HALTED) then throw("Invalid CB level")
+  else {
+    let callerStr = toBase58String(i.caller.bytes)
+    let currentLevel = getInteger(this, keyMarketCircuitBreaker(pairId)).valueOrElse(CB_NONE)
+
+    let callerIsAdmin = isRiskAdmin(callerStr) || i.caller == this
+    let callerIsOperator = isOperator(callerStr)
+
+    if (!callerIsAdmin && !callerIsOperator) then throw("Not authorized")
+    else if (!callerIsAdmin && level <= currentLevel) then throw("Operator can only escalate CB level")
+    else {
+      [IntegerEntry(keyMarketCircuitBreaker(pairId), level)]
+    }
+  }
+}
+
+# ===========================================================================
+# @Callable: grantRiskAdmin / revokeRiskAdmin
+# ===========================================================================
+
+@Callable(i)
+func grantRiskAdmin(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner")
+  else [BooleanEntry(keyRiskAdmin(addr), true)]
+}
+
+@Callable(i)
+func revokeRiskAdmin(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner")
+  else [BooleanEntry(keyRiskAdmin(addr), false)]
+}
+
+# ===========================================================================
+# @Callable: grantOperator / revokeOperator
+# ===========================================================================
+
+@Callable(i)
+func grantOperator(addr: String) = {
+  strict adminCheck = requireRiskAdmin(i.caller)
+  [BooleanEntry(keyOperator(addr), true)]
+}
+
+@Callable(i)
+func revokeOperator(addr: String) = {
+  strict adminCheck = requireRiskAdmin(i.caller)
+  [BooleanEntry(keyOperator(addr), false)]
+}

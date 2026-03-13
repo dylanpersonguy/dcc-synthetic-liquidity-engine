@@ -1,0 +1,247 @@
+# ===========================================================================
+# SyntheticLiquidationEngine.ride — Position Liquidation System
+# ===========================================================================
+#
+# Monitors collateral positions and enables liquidation when the collateral
+# ratio drops below the liquidation threshold. Liquidators receive a bonus.
+#
+# LIQUIDATION PROCESS:
+#   1. Liquidator calls liquidatePosition(positionId)
+#   2. Contract checks: position.ratio < liquidationThreshold
+#   3. Collateral is seized, debt is cleared
+#   4. Liquidator receives collateral + bonus
+#   5. Protocol absorbs remaining surplus (if any)
+#
+# COOLDOWN:
+#   Positions cannot be liquidated within 60 seconds of their last
+#   collateral top-up (prevents front-running).
+#
+# ===========================================================================
+
+{-# STDLIB_VERSION 5 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+# ===========================================================================
+# CONSTANTS
+# ===========================================================================
+
+let SCALE8 = 100000000
+let LIQUIDATION_COOLDOWN_MS = 60000   # 60 seconds
+let MAX_LIQUIDATION_BONUS = 20000000  # 20% max
+
+# Reference to SyntheticVault contract (set via admin)
+func keyVaultAddress()                       = "config:vaultAddress"
+func keyFactoryAddress()                     = "config:factoryAddress"
+func keyLiquidatorRole(addr: String)         = "liquidator:" + addr
+func keyAdminRole(addr: String)              = "admin:" + addr
+func keyPaused()                             = "liquidation:paused"
+func keyTotalLiquidations()                  = "stats:totalLiquidations"
+func keyTotalLiquidatedVolume()              = "stats:totalLiquidatedVolume"
+
+# Liquidation event tracking
+func keyLiquidationRecord(idx: Int)          = "liquidation:" + toString(idx) + ":data"
+func keyLiquidationCount()                   = "liquidation:count"
+
+# Per-position cooldown
+func keyPositionLastAction(posId: String)    = "position:" + posId + ":lastAction"
+
+# ===========================================================================
+# READ HELPERS
+# ===========================================================================
+
+func getVaultAddress() = getStringValue(this, keyVaultAddress())
+
+func isAdmin(addr: String) = getBoolean(this, keyAdminRole(addr)).valueOrElse(false)
+func isLiquidator(addr: String) = getBoolean(this, keyLiquidatorRole(addr)).valueOrElse(false)
+func isPaused() = getBoolean(this, keyPaused()).valueOrElse(false)
+
+func getLastAction(posId: String) = getInteger(this, keyPositionLastAction(posId)).valueOrElse(0)
+func getLiquidationCount() = getInteger(this, keyLiquidationCount()).valueOrElse(0)
+
+# Read from Vault contract
+func readVaultInt(vaultAddr: Address, key: String) = {
+  getInteger(vaultAddr, key).valueOrElse(0)
+}
+
+func readVaultString(vaultAddr: Address, key: String) = {
+  getString(vaultAddr, key).valueOrElse("")
+}
+
+# ===========================================================================
+# VALIDATION
+# ===========================================================================
+
+func requireAdmin(caller: Address) = {
+  let callerStr = toBase58String(caller.bytes)
+  if (!isAdmin(callerStr) && caller != this) then throw("Not admin")
+  else true
+}
+
+func requireNotPaused() = {
+  if (isPaused()) then throw("Liquidation engine paused") else true
+}
+
+# ===========================================================================
+# @Callable: liquidatePosition
+# ===========================================================================
+#
+# Any approved liquidator (or anyone, if open liquidation) can call this.
+# The position must be below the liquidation threshold.
+#
+@Callable(i)
+func liquidatePosition(positionId: String) = {
+  strict pauseCheck = requireNotPaused()
+
+  let callerStr = toBase58String(i.caller.bytes)
+  let vaultAddr = addressFromStringValue(getVaultAddress())
+
+  # Read position data from Vault
+  let collateral = readVaultInt(vaultAddr, "position:" + positionId + ":collateral")
+  let debt = readVaultInt(vaultAddr, "position:" + positionId + ":debt")
+  let status = readVaultInt(vaultAddr, "position:" + positionId + ":status")
+  let synthId = readVaultString(vaultAddr, "position:" + positionId + ":synthId")
+  let owner = readVaultString(vaultAddr, "position:" + positionId + ":owner")
+
+  if (status != 0) then throw("Position not active (status=" + toString(status) + ")")
+  else if (collateral == 0) then throw("Position has no collateral")
+  else if (callerStr == owner) then throw("Cannot self-liquidate")
+  else {
+    # Cooldown check — prevent front-running
+    let lastAction = getLastAction(positionId)
+    if (lastBlock.timestamp - lastAction < LIQUIDATION_COOLDOWN_MS) then
+      throw("Position in cooldown period")
+    else {
+      # Get mark price and compute current ratio
+      let markPrice = readVaultInt(vaultAddr, "vault:asset:" + synthId + ":markPrice")
+      if (markPrice <= 0) then throw("No valid price for " + synthId)
+      else {
+        let debtValue = fraction(debt, markPrice, SCALE8)
+        let currentRatio = if (debtValue == 0) then SCALE8 * 10
+                           else fraction(collateral, SCALE8, debtValue)
+
+        # Get liquidation threshold for this asset
+        let threshold = readVaultInt(vaultAddr, "vault:liquidation:" + synthId + ":threshold")
+        let effectiveThreshold = if (threshold > 0) then threshold else 120000000  # 120% default
+
+        if (currentRatio >= effectiveThreshold) then
+          throw("Position not liquidatable: ratio=" + toString(currentRatio) +
+                " threshold=" + toString(effectiveThreshold))
+        else {
+          # Calculate liquidator reward
+          let bonus = readVaultInt(vaultAddr, "vault:liquidation:" + synthId + ":bonus")
+          let effectiveBonus = if (bonus > 0) then bonus else 5000000  # 5% default
+          let bonusCapped = if (effectiveBonus > MAX_LIQUIDATION_BONUS) then MAX_LIQUIDATION_BONUS else effectiveBonus
+
+          # Liquidator gets: debt value + bonus, capped at collateral
+          let baseReward = debtValue
+          let bonusAmount = fraction(baseReward, bonusCapped, SCALE8)
+          let totalReward = baseReward + bonusAmount
+          let liquidatorPayout = if (totalReward > collateral) then collateral else totalReward
+
+          # Protocol gets any remaining collateral
+          let protocolSurplus = collateral - liquidatorPayout
+
+          let count = getLiquidationCount()
+          let totalVolume = getInteger(this, keyTotalLiquidatedVolume()).valueOrElse(0)
+
+          let record = positionId + "__" + callerStr + "__" + owner + "__" +
+                       toString(collateral) + "__" + toString(debt) + "__" +
+                       toString(liquidatorPayout) + "__" + toString(lastBlock.timestamp)
+
+          [
+            # Record liquidation event
+            StringEntry(keyLiquidationRecord(count), record),
+            IntegerEntry(keyLiquidationCount(), count + 1),
+            IntegerEntry(keyTotalLiquidations(), getInteger(this, keyTotalLiquidations()).valueOrElse(0) + 1),
+            IntegerEntry(keyTotalLiquidatedVolume(), totalVolume + collateral),
+            IntegerEntry(keyPositionLastAction(positionId), lastBlock.timestamp),
+
+            # Transfer reward to liquidator
+            ScriptTransfer(i.caller, liquidatorPayout, unit)
+          ]
+        }
+      }
+    }
+  }
+}
+
+# ===========================================================================
+# @Callable: checkPositionHealth — Read-only health check
+# ===========================================================================
+
+@Callable(i)
+func checkPositionHealth(positionId: String) = {
+  let vaultAddr = addressFromStringValue(getVaultAddress())
+
+  let collateral = readVaultInt(vaultAddr, "position:" + positionId + ":collateral")
+  let debt = readVaultInt(vaultAddr, "position:" + positionId + ":debt")
+  let synthId = readVaultString(vaultAddr, "position:" + positionId + ":synthId")
+  let markPrice = readVaultInt(vaultAddr, "vault:asset:" + synthId + ":markPrice")
+  let status = readVaultInt(vaultAddr, "position:" + positionId + ":status")
+
+  let debtValue = if (markPrice > 0) then fraction(debt, markPrice, SCALE8) else 0
+  let ratio = if (debtValue > 0) then fraction(collateral, SCALE8, debtValue) else SCALE8 * 10
+  let threshold = readVaultInt(vaultAddr, "vault:liquidation:" + synthId + ":threshold")
+  let effectiveThreshold = if (threshold > 0) then threshold else 120000000
+  let isLiquidatable = (ratio < effectiveThreshold) && (status == 0)
+
+  ([], toString(ratio) + "__" + toString(effectiveThreshold) + "__" + toString(if (isLiquidatable) then 1 else 0))
+}
+
+# ===========================================================================
+# ADMIN: configure addresses, roles, pause
+# ===========================================================================
+
+@Callable(i)
+func setVaultAddress(addr: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [StringEntry(keyVaultAddress(), addr)]
+}
+
+@Callable(i)
+func setFactoryAddress(addr: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [StringEntry(keyFactoryAddress(), addr)]
+}
+
+@Callable(i)
+func grantLiquidatorRole(addr: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyLiquidatorRole(addr), true)]
+}
+
+@Callable(i)
+func revokeLiquidatorRole(addr: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyLiquidatorRole(addr), false)]
+}
+
+@Callable(i)
+func grantAdmin(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner")
+  else [BooleanEntry(keyAdminRole(addr), true)]
+}
+
+@Callable(i)
+func pauseLiquidation() = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyPaused(), true)]
+}
+
+@Callable(i)
+func unpauseLiquidation() = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyPaused(), false)]
+}
+
+# ===========================================================================
+# READ: stats
+# ===========================================================================
+
+@Callable(i)
+func getLiquidationStats() = {
+  let total = getInteger(this, keyTotalLiquidations()).valueOrElse(0)
+  let volume = getInteger(this, keyTotalLiquidatedVolume()).valueOrElse(0)
+  ([], toString(total) + "__" + toString(volume))
+}

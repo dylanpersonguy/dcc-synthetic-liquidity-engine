@@ -1,0 +1,27 @@
+{
+  "name": "@dcc/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DCC on-chain contract interfaces and blueprints",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "deploy": "npx tsx scripts/deploy.ts",
+    "seed-oracles": "npx tsx scripts/seed-oracles.ts",
+    "oracle-daemon": "npx tsx scripts/oracle-daemon.ts",
+    "setup-chain": "npx tsx scripts/setup-chain.ts",
+    "redeploy-amm": "npx tsx scripts/redeploy-amm.ts"
+  },
+  "dependencies": {
+    "@dcc/types": "workspace:*",
+    "@waves/ride-js": "^2.3.0",
+    "@waves/waves-transactions": "^4.3.11"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}

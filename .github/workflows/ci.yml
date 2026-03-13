@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dcc
+          POSTGRES_PASSWORD: dcc_dev_password
+          POSTGRES_DB: dcc_liquidity
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dcc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Unit tests
+        run: pnpm exec vitest run --reporter=verbose
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql://dcc:dcc_dev_password@localhost:5432/dcc_liquidity
+        run: pnpm --filter @dcc/database migrate
+
+      - name: Seed database
+        env:
+          DATABASE_URL: postgresql://dcc:dcc_dev_password@localhost:5432/dcc_liquidity
+        run: pnpm --filter @dcc/database seed
+
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image (operator-api target)
+        run: docker build --target operator-api -t dcc/operator-api:test .
+
+      - name: Build Docker image (execution-service target)
+        run: docker build --target execution-service -t dcc/execution-service:test .

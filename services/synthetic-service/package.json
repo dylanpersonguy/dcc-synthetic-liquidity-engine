@@ -1,0 +1,26 @@
+{
+  "name": "@dcc/synthetic-service",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@dcc/types": "workspace:*",
+    "@dcc/config": "workspace:*",
+    "@dcc/database": "workspace:*",
+    "@dcc/metrics": "workspace:*",
+    "@fastify/cors": "^10.0.0",
+    "@waves/waves-transactions": "^4.3.11",
+    "fastify": "^5.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}

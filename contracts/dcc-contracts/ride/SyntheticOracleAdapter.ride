@@ -1,0 +1,420 @@
+{-# STDLIB_VERSION 5 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+# ============================================================
+# SyntheticOracleAdapter.ride
+# Oracle price aggregation with multi-source validation
+# ============================================================
+
+let SCALE8 = 100_000_000
+let MAX_SOURCES = 10
+let MAX_DEVIATION_BPS = 500         # 5% max deviation between sources
+let DEFAULT_STALENESS_MS = 60_000   # 60 seconds default staleness
+let MIN_SOURCES_FOR_CONFIDENCE = 2
+let CONFIDENCE_HIGH = 90
+let CONFIDENCE_MEDIUM = 70
+let CONFIDENCE_LOW = 40
+
+# ---- Storage Key Helpers ----
+
+func keyAdmin(addr: String) = "admin_" + addr
+func keyPaused() = "paused"
+
+func keySourceCount(synthId: String) = "oracle_" + synthId + "_sourceCount"
+func keySourceVenue(synthId: String, idx: Int) = "oracle_" + synthId + "_source_" + toString(idx) + "_venue"
+func keySourceWeight(synthId: String, idx: Int) = "oracle_" + synthId + "_source_" + toString(idx) + "_weight"
+func keySourceStaleness(synthId: String, idx: Int) = "oracle_" + synthId + "_source_" + toString(idx) + "_stalenessMs"
+func keySourceEnabled(synthId: String, idx: Int) = "oracle_" + synthId + "_source_" + toString(idx) + "_enabled"
+
+func keyPrice(synthId: String) = "price_" + synthId
+func keyPriceTimestamp(synthId: String) = "price_" + synthId + "_timestamp"
+func keyPriceConfidence(synthId: String) = "price_" + synthId + "_confidence"
+func keyPriceSourceCount(synthId: String) = "price_" + synthId + "_sourceCount"
+
+func keySourcePrice(synthId: String, venue: String) = "price_" + synthId + "_venue_" + venue
+func keySourcePriceTs(synthId: String, venue: String) = "price_" + synthId + "_venue_" + venue + "_ts"
+
+func keyTotalUpdates(synthId: String) = "stats_" + synthId + "_totalUpdates"
+func keyLastAggregation(synthId: String) = "stats_" + synthId + "_lastAggregation"
+
+# ---- Read Helpers ----
+
+func isAdmin(addr: String) = valueOrElse(getBoolean(this, keyAdmin(addr)), false)
+func isPaused() = valueOrElse(getBoolean(this, keyPaused()), false)
+func getSourceCount(synthId: String) = valueOrElse(getInteger(this, keySourceCount(synthId)), 0)
+
+func requireAdmin(caller: Address) = {
+  if (!isAdmin(toBase58String(caller.bytes)))
+  then throw("ORACLE: admin only")
+  else true
+}
+
+func requireNotPaused() = {
+  if (isPaused())
+  then throw("ORACLE: paused")
+  else true
+}
+
+# ---- Price Computation Helpers ----
+
+# Weighted average price from an array of (price, weight) pairs
+# Uses recursive accumulation approach
+func computeWeightedPrice(
+  prices: List[Int],
+  weights: List[Int],
+  count: Int
+) = {
+  func accumulate(acc: (Int, Int), idx: Int) = {
+    if (idx >= count) then acc
+    else {
+      let p = prices[idx]
+      let w = weights[idx]
+      (acc._1 + fraction(p, w, SCALE8), acc._2 + w)
+    }
+  }
+
+  let r0 = accumulate((0, 0), 0)
+  let r1 = accumulate(r0, 1)
+  let r2 = accumulate(r1, 2)
+  let r3 = accumulate(r2, 3)
+  let r4 = accumulate(r3, 4)
+  let r5 = accumulate(r4, 5)
+  let r6 = accumulate(r5, 6)
+  let r7 = accumulate(r6, 7)
+  let r8 = accumulate(r7, 8)
+  let r9 = accumulate(r8, 9)
+
+  let totalWeightedPrice = r9._1
+  let totalWeight = r9._2
+
+  if (totalWeight == 0) then 0
+  else fraction(totalWeightedPrice, SCALE8, totalWeight)
+}
+
+# Check if a price deviates too far from the median
+func isOutlier(price: Int, median: Int, maxDeviationBps: Int) = {
+  if (median == 0) then false
+  else {
+    let diff = if (price > median) then price - median else median - price
+    let deviationBps = fraction(diff, 10000, median)
+    deviationBps > maxDeviationBps
+  }
+}
+
+# Compute confidence score based on source count and freshness
+func computeConfidence(validSourceCount: Int, totalSourceCount: Int, hasOutliers: Boolean) = {
+  let baseConfidence = if (validSourceCount >= 3) then CONFIDENCE_HIGH
+    else if (validSourceCount >= 2) then CONFIDENCE_MEDIUM
+    else CONFIDENCE_LOW
+
+  let outlierPenalty = if (hasOutliers) then 15 else 0
+  let coveragePenalty = if (totalSourceCount > 0)
+    then fraction((totalSourceCount - validSourceCount), 10, totalSourceCount)
+    else 0
+
+  let finalConfidence = baseConfidence - outlierPenalty - coveragePenalty
+  if (finalConfidence < 0) then 0 else finalConfidence
+}
+
+# ============================================================
+# Admin Functions
+# ============================================================
+
+@Callable(i)
+func grantAdmin(addr: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyAdmin(addr), true)]
+}
+
+@Callable(i)
+func revokeAdmin(addr: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [DeleteEntry(keyAdmin(addr))]
+}
+
+@Callable(i)
+func initialize() = {
+  if (isDefined(getBoolean(this, keyAdmin(toBase58String(i.caller.bytes)))))
+  then throw("ORACLE: already initialized")
+  else [BooleanEntry(keyAdmin(toBase58String(i.caller.bytes)), true)]
+}
+
+@Callable(i)
+func pauseOracle() = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyPaused(), true)]
+}
+
+@Callable(i)
+func unpauseOracle() = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyPaused(), false)]
+}
+
+# ============================================================
+# Oracle Source Management
+# ============================================================
+
+@Callable(i)
+func addOracleSource(
+  synthId: String,
+  venue: String,
+  weight: Int,
+  stalenessMs: Int
+) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict pauseCheck = requireNotPaused()
+
+  if (weight <= 0 || weight > SCALE8)
+  then throw("ORACLE: invalid weight")
+  else if (stalenessMs <= 0)
+  then throw("ORACLE: invalid staleness")
+  else {
+    let count = getSourceCount(synthId)
+    if (count >= MAX_SOURCES)
+    then throw("ORACLE: max sources reached")
+    else [
+      StringEntry(keySourceVenue(synthId, count), venue),
+      IntegerEntry(keySourceWeight(synthId, count), weight),
+      IntegerEntry(keySourceStaleness(synthId, count), stalenessMs),
+      BooleanEntry(keySourceEnabled(synthId, count), true),
+      IntegerEntry(keySourceCount(synthId), count + 1)
+    ]
+  }
+}
+
+@Callable(i)
+func updateOracleSource(
+  synthId: String,
+  idx: Int,
+  weight: Int,
+  stalenessMs: Int,
+  enabled: Boolean
+) = {
+  strict adminCheck = requireAdmin(i.caller)
+
+  let count = getSourceCount(synthId)
+  if (idx < 0 || idx >= count)
+  then throw("ORACLE: source index out of bounds")
+  else if (weight <= 0 || weight > SCALE8)
+  then throw("ORACLE: invalid weight")
+  else [
+    IntegerEntry(keySourceWeight(synthId, idx), weight),
+    IntegerEntry(keySourceStaleness(synthId, idx), stalenessMs),
+    BooleanEntry(keySourceEnabled(synthId, idx), enabled)
+  ]
+}
+
+@Callable(i)
+func removeOracleSource(synthId: String, idx: Int) = {
+  strict adminCheck = requireAdmin(i.caller)
+
+  let count = getSourceCount(synthId)
+  if (idx < 0 || idx >= count)
+  then throw("ORACLE: source index out of bounds")
+  else [
+    BooleanEntry(keySourceEnabled(synthId, idx), false)
+  ]
+}
+
+# ============================================================
+# Price Submission
+# ============================================================
+
+@Callable(i)
+func submitPrice(synthId: String, venue: String, price: Int) = {
+  strict pauseCheck = requireNotPaused()
+
+  if (price <= 0)
+  then throw("ORACLE: price must be positive")
+  else {
+    let count = getSourceCount(synthId)
+    if (count == 0)
+    then throw("ORACLE: no sources configured for " + synthId)
+    else {
+      # Verify the caller is authorized to submit for this venue
+      # For now, allow any caller (operators submit via off-chain service)
+      let now = lastBlock.timestamp
+
+      [
+        IntegerEntry(keySourcePrice(synthId, venue), price),
+        IntegerEntry(keySourcePriceTs(synthId, venue), now)
+      ]
+    }
+  }
+}
+
+@Callable(i)
+func submitPriceBatch(synthIds: String, venues: String, prices: String) = {
+  strict pauseCheck = requireNotPaused()
+
+  let synthList = split(synthIds, ",")
+  let venueList = split(venues, ",")
+  let priceList = split(prices, ",")
+
+  let length = size(synthList)
+  if (length != size(venueList) || length != size(priceList))
+  then throw("ORACLE: array length mismatch")
+  else if (length == 0 || length > 10)
+  then throw("ORACLE: batch size must be 1-10")
+  else {
+    let now = lastBlock.timestamp
+
+    func buildEntry(acc: List[StringEntry|IntegerEntry], idx: Int) = {
+      if (idx >= length) then acc
+      else {
+        let p = parseIntValue(priceList[idx])
+        if (p <= 0) then throw("ORACLE: price must be positive at index " + toString(idx))
+        else acc ++ [
+          IntegerEntry(keySourcePrice(synthList[idx], venueList[idx]), p),
+          IntegerEntry(keySourcePriceTs(synthList[idx], venueList[idx]), now)
+        ]
+      }
+    }
+
+    let r0 = buildEntry([], 0)
+    let r1 = buildEntry(r0, 1)
+    let r2 = buildEntry(r1, 2)
+    let r3 = buildEntry(r2, 3)
+    let r4 = buildEntry(r3, 4)
+    let r5 = buildEntry(r4, 5)
+    let r6 = buildEntry(r5, 6)
+    let r7 = buildEntry(r6, 7)
+    let r8 = buildEntry(r7, 8)
+    let r9 = buildEntry(r8, 9)
+    r9
+  }
+}
+
+# ============================================================
+# Price Aggregation
+# ============================================================
+
+@Callable(i)
+func aggregatePrice(synthId: String) = {
+  strict pauseCheck = requireNotPaused()
+
+  let count = getSourceCount(synthId)
+  if (count == 0)
+  then throw("ORACLE: no sources for " + synthId)
+  else {
+    let now = lastBlock.timestamp
+
+    # Collect fresh, enabled source prices
+    func collectPrices(acc: (List[Int], List[Int], Int, Boolean), idx: Int) = {
+      if (idx >= count) then acc
+      else {
+        let enabled = valueOrElse(getBoolean(this, keySourceEnabled(synthId, idx)), false)
+        if (!enabled) then acc
+        else {
+          let venue = getStringValue(this, keySourceVenue(synthId, idx))
+          let weight = getIntegerValue(this, keySourceWeight(synthId, idx))
+          let stalenessMs = getIntegerValue(this, keySourceStaleness(synthId, idx))
+          let priceOpt = getInteger(this, keySourcePrice(synthId, venue))
+          let tsOpt = getInteger(this, keySourcePriceTs(synthId, venue))
+
+          match priceOpt {
+            case p: Int =>
+              match tsOpt {
+                case ts: Int =>
+                  let age = now - ts
+                  if (age > stalenessMs) then acc  # Skip stale
+                  else (acc._1 :+ p, acc._2 :+ weight, acc._3 + 1, acc._4)
+                case _ => acc
+              }
+            case _ => acc
+          }
+        }
+      }
+    }
+
+    let c0 = collectPrices(([], [], 0, false), 0)
+    let c1 = collectPrices(c0, 1)
+    let c2 = collectPrices(c1, 2)
+    let c3 = collectPrices(c2, 3)
+    let c4 = collectPrices(c3, 4)
+    let c5 = collectPrices(c4, 5)
+    let c6 = collectPrices(c5, 6)
+    let c7 = collectPrices(c6, 7)
+    let c8 = collectPrices(c7, 8)
+    let c9 = collectPrices(c8, 9)
+
+    let validPrices = c9._1
+    let validWeights = c9._2
+    let validCount = c9._3
+
+    if (validCount == 0)
+    then throw("ORACLE: no fresh prices for " + synthId)
+    else {
+      let weightedPrice = computeWeightedPrice(validPrices, validWeights, validCount)
+
+      # Check for outliers using first valid price as approximate median
+      let approxMedian = validPrices[0]
+      let hasOutliers = if (validCount >= 2) then {
+        func checkOutlier(acc: Boolean, idx: Int) = {
+          if (idx >= validCount) then acc
+          else acc || isOutlier(validPrices[idx], approxMedian, MAX_DEVIATION_BPS)
+        }
+        let o0 = checkOutlier(false, 0)
+        let o1 = checkOutlier(o0, 1)
+        let o2 = checkOutlier(o1, 2)
+        let o3 = checkOutlier(o2, 3)
+        let o4 = checkOutlier(o3, 4)
+        o4
+      } else false
+
+      let confidence = computeConfidence(validCount, count, hasOutliers)
+      let totalUpdates = valueOrElse(getInteger(this, keyTotalUpdates(synthId)), 0)
+
+      [
+        IntegerEntry(keyPrice(synthId), weightedPrice),
+        IntegerEntry(keyPriceTimestamp(synthId), now),
+        IntegerEntry(keyPriceConfidence(synthId), confidence),
+        IntegerEntry(keyPriceSourceCount(synthId), validCount),
+        IntegerEntry(keyTotalUpdates(synthId), totalUpdates + 1),
+        IntegerEntry(keyLastAggregation(synthId), now)
+      ]
+    }
+  }
+}
+
+# ============================================================
+# Read Functions
+# ============================================================
+
+@Callable(i)
+func getPrice(synthId: String) = {
+  let price = valueOrElse(getInteger(this, keyPrice(synthId)), 0)
+  let ts = valueOrElse(getInteger(this, keyPriceTimestamp(synthId)), 0)
+  let confidence = valueOrElse(getInteger(this, keyPriceConfidence(synthId)), 0)
+  let sourceCount = valueOrElse(getInteger(this, keyPriceSourceCount(synthId)), 0)
+
+  ([], (price, ts, confidence, sourceCount))
+}
+
+@Callable(i)
+func getOracleSourceInfo(synthId: String) = {
+  let count = getSourceCount(synthId)
+  let totalUpdates = valueOrElse(getInteger(this, keyTotalUpdates(synthId)), 0)
+  let lastAgg = valueOrElse(getInteger(this, keyLastAggregation(synthId)), 0)
+
+  ([], (count, totalUpdates, lastAgg))
+}
+
+@Callable(i)
+func getSourceDetail(synthId: String, idx: Int) = {
+  let count = getSourceCount(synthId)
+  if (idx < 0 || idx >= count)
+  then throw("ORACLE: index out of bounds")
+  else {
+    let venue = getStringValue(this, keySourceVenue(synthId, idx))
+    let weight = getIntegerValue(this, keySourceWeight(synthId, idx))
+    let stalenessMs = getIntegerValue(this, keySourceStaleness(synthId, idx))
+    let enabled = valueOrElse(getBoolean(this, keySourceEnabled(synthId, idx)), false)
+    let lastPrice = valueOrElse(getInteger(this, keySourcePrice(synthId, venue)), 0)
+    let lastTs = valueOrElse(getInteger(this, keySourcePriceTs(synthId, venue)), 0)
+
+    ([], (venue, weight, stalenessMs, enabled, lastPrice, lastTs))
+  }
+}

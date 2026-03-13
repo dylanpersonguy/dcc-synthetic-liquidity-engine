@@ -1,0 +1,513 @@
+# ===========================================================================
+# SyntheticVault.ride — Protocol Balance Sheet for Synthetic Exposure
+# ===========================================================================
+#
+# Holds collateral reserves, tracks per-asset liabilities, enforces backing
+# ratio constraints, and integrates with the factory for mint/burn accounting.
+#
+# STORAGE:
+#   vault:totalBackingValue             — aggregate backing in hub asset
+#   vault:totalLiabilityValue           — aggregate liability at mark
+#   vault:backingRatio                  — computed ratio (fixed-point 8)
+#   vault:asset:{id}:supply             — outstanding supply
+#   vault:asset:{id}:markPrice          — last oracle price (fixed-point 8)
+#   vault:asset:{id}:liabilityValue     — supply × markPrice
+#   vault:asset:{id}:backingAllocated   — allocated backing portion
+#   vault:reserves:{assetId}            — reserve balance per collateral
+#   position:{id}:*                     — per-user collateral positions
+#
+# ===========================================================================
+
+{-# STDLIB_VERSION 5 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+# ===========================================================================
+# CONSTANTS
+# ===========================================================================
+
+let SCALE8 = 100000000
+let MIN_BACKING_RATIO = 80000000     # 80% — hard floor for withdrawals
+let WARN_BACKING_RATIO = 110000000   # 110% — warning threshold
+let DEFAULT_COLLATERAL_RATIO = 150000000  # 150% — required to mint
+
+# DUSD — the collateral token for minting overcollateralized synthetics
+let DUSD_ASSET_ID = base58'ACmPEtWQLQnZJcvZD7BWrnc4EySyu2kYFzEF8YFRcH9q'
+
+# Position statuses
+let POS_ACTIVE     = 0
+let POS_LIQUIDATED = 1
+let POS_CLOSED     = 2
+
+# ===========================================================================
+# KEY HELPERS
+# ===========================================================================
+
+# Global vault keys
+func keyTotalBackingValue()                  = "vault:totalBackingValue"
+func keyTotalLiabilityValue()                = "vault:totalLiabilityValue"
+func keyBackingRatio()                       = "vault:backingRatio"
+
+# Per-synthetic asset keys
+func keyAssetSupply(synthId: String)         = "vault:asset:" + synthId + ":supply"
+func keyAssetMarkPrice(synthId: String)      = "vault:asset:" + synthId + ":markPrice"
+func keyAssetLiability(synthId: String)      = "vault:asset:" + synthId + ":liabilityValue"
+func keyAssetBacking(synthId: String)        = "vault:asset:" + synthId + ":backingAllocated"
+
+# Reserve keys (collateral)
+func keyReserves(assetId: String)            = "vault:reserves:" + assetId
+
+# Position keys (per-user collateral positions)
+func keyPositionOwner(posId: String)         = "position:" + posId + ":owner"
+func keyPositionSynthId(posId: String)       = "position:" + posId + ":synthId"
+func keyPositionCollateral(posId: String)    = "position:" + posId + ":collateral"
+func keyPositionCollateralAsset(posId: String) = "position:" + posId + ":collateralAsset"
+func keyPositionDebt(posId: String)          = "position:" + posId + ":debt"
+func keyPositionRatio(posId: String)         = "position:" + posId + ":ratio"
+func keyPositionStatus(posId: String)        = "position:" + posId + ":status"
+func keyPositionCreatedAt(posId: String)     = "position:" + posId + ":createdAt"
+func keyPositionUpdatedAt(posId: String)     = "position:" + posId + ":updatedAt"
+
+func keyPositionsCount()                     = "positions:count"
+func keyUserPositionCount(addr: String)      = "user:" + addr + ":positionCount"
+
+# Roles
+func keyVaultAdmin(addr: String)             = "vaultAdmin:" + addr
+func keyTreasuryRole(addr: String)           = "treasury:" + addr
+func keyMintRole(addr: String)               = "mintRole:" + addr
+func keyVaultPaused()                        = "vault:paused"
+
+# Liquidation config
+func keyLiquidationThreshold(synthId: String) = "vault:liquidation:" + synthId + ":threshold"
+func keyLiquidationBonus(synthId: String)    = "vault:liquidation:" + synthId + ":bonus"
+
+# ===========================================================================
+# READ HELPERS
+# ===========================================================================
+
+func getTotalBackingValue() = getInteger(this, keyTotalBackingValue()).valueOrElse(0)
+func getTotalLiabilityValue() = getInteger(this, keyTotalLiabilityValue()).valueOrElse(0)
+func getBackingRatio() = getInteger(this, keyBackingRatio()).valueOrElse(SCALE8)
+
+func getAssetSupply(synthId: String) = getInteger(this, keyAssetSupply(synthId)).valueOrElse(0)
+func getAssetMarkPrice(synthId: String) = getInteger(this, keyAssetMarkPrice(synthId)).valueOrElse(0)
+func getReserveBalance(assetId: String) = getInteger(this, keyReserves(assetId)).valueOrElse(0)
+
+func getPositionCollateral(posId: String) = getInteger(this, keyPositionCollateral(posId)).valueOrElse(0)
+func getPositionDebt(posId: String) = getInteger(this, keyPositionDebt(posId)).valueOrElse(0)
+func getPositionStatus(posId: String) = getInteger(this, keyPositionStatus(posId)).valueOrElse(-1)
+
+func isVaultAdmin(addr: String) = getBoolean(this, keyVaultAdmin(addr)).valueOrElse(false)
+func isTreasury(addr: String) = getBoolean(this, keyTreasuryRole(addr)).valueOrElse(false)
+func isMintRole(addr: String) = getBoolean(this, keyMintRole(addr)).valueOrElse(false)
+func isVaultPaused() = getBoolean(this, keyVaultPaused()).valueOrElse(false)
+
+func getLiquidationThreshold(synthId: String) = {
+  getInteger(this, keyLiquidationThreshold(synthId)).valueOrElse(120000000)  # 120% default
+}
+func getLiquidationBonus(synthId: String) = {
+  getInteger(this, keyLiquidationBonus(synthId)).valueOrElse(5000000)  # 5% default
+}
+
+# ===========================================================================
+# COMPUTATION HELPERS
+# ===========================================================================
+
+func computeRatio(collateral: Int, debt: Int, markPrice: Int) = {
+  if (debt == 0) then SCALE8 * 10  # effectively infinite ratio
+  else {
+    let debtValue = fraction(debt, markPrice, SCALE8)
+    if (debtValue == 0) then SCALE8 * 10
+    else fraction(collateral, SCALE8, debtValue)
+  }
+}
+
+func computeBackingRatio(totalBacking: Int, totalLiability: Int) = {
+  if (totalLiability == 0) then SCALE8 * 10
+  else fraction(totalBacking, SCALE8, totalLiability)
+}
+
+# ===========================================================================
+# VALIDATION
+# ===========================================================================
+
+func requireVaultAdmin(caller: Address) = {
+  let callerStr = toBase58String(caller.bytes)
+  if (!isVaultAdmin(callerStr) && caller != this) then throw("Not vault admin")
+  else true
+}
+
+func requireMintRole(caller: Address) = {
+  let callerStr = toBase58String(caller.bytes)
+  if (!isMintRole(callerStr)) then throw("Not mint role")
+  else true
+}
+
+func requireVaultNotPaused() = {
+  if (isVaultPaused()) then throw("Vault is paused") else true
+}
+
+# ===========================================================================
+# @Callable: depositReserves — Deposit collateral reserves
+# ===========================================================================
+
+@Callable(i)
+func depositReserves(assetId: String) = {
+  strict adminCheck = requireVaultAdmin(i.caller)
+  strict pauseCheck = requireVaultNotPaused()
+
+  let pmt = i.payments[0].valueOrErrorMessage("Must attach collateral")
+  let amount = pmt.amount
+
+  if (amount <= 0) then throw("Amount must be positive")
+  else {
+    let current = getReserveBalance(assetId)
+    let newBalance = current + amount
+    let totalBacking = getTotalBackingValue() + amount
+    let totalLiability = getTotalLiabilityValue()
+    let newRatio = computeBackingRatio(totalBacking, totalLiability)
+
+    [
+      IntegerEntry(keyReserves(assetId), newBalance),
+      IntegerEntry(keyTotalBackingValue(), totalBacking),
+      IntegerEntry(keyBackingRatio(), newRatio)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: withdrawReserves — Withdraw reserves (backing ratio floor)
+# ===========================================================================
+
+@Callable(i)
+func withdrawReserves(assetId: String, amount: Int) = {
+  let callerStr = toBase58String(i.caller.bytes)
+  if (!isVaultAdmin(callerStr) && !isTreasury(callerStr) && i.caller != this) then
+    throw("Not authorized to withdraw")
+  else if (amount <= 0) then throw("Amount must be positive")
+  else {
+    let current = getReserveBalance(assetId)
+    if (amount > current) then throw("Insufficient reserves")
+    else {
+      let newBalance = current - amount
+      let totalBacking = getTotalBackingValue() - amount
+      let totalLiability = getTotalLiabilityValue()
+      let newRatio = computeBackingRatio(totalBacking, totalLiability)
+
+      if (newRatio < MIN_BACKING_RATIO) then
+        throw("Withdrawal would breach minimum backing ratio (80%)")
+      else {
+        [
+          IntegerEntry(keyReserves(assetId), newBalance),
+          IntegerEntry(keyTotalBackingValue(), totalBacking),
+          IntegerEntry(keyBackingRatio(), newRatio),
+          ScriptTransfer(i.caller, amount, unit)
+        ]
+      }
+    }
+  }
+}
+
+# ===========================================================================
+# @Callable: openPosition — User opens collateral position to mint synthetics
+# ===========================================================================
+
+@Callable(i)
+func openPosition(positionId: String, synthId: String, debtAmount: Int) = {
+  strict pauseCheck = requireVaultNotPaused()
+
+  if (getPositionStatus(positionId) >= 0) then throw("Position already exists")
+  else if (debtAmount <= 0) then throw("Debt amount must be positive")
+  else {
+    let pmt = i.payments[0].valueOrErrorMessage("Must attach collateral")
+    let collateralAmount = pmt.amount
+    let callerStr = toBase58String(i.caller.bytes)
+
+    let markPrice = getAssetMarkPrice(synthId)
+    if (markPrice <= 0) then throw("No valid price for " + synthId)
+    else {
+      let ratio = computeRatio(collateralAmount, debtAmount, markPrice)
+      if (ratio < DEFAULT_COLLATERAL_RATIO) then
+        throw("Insufficient collateral: ratio=" + toString(ratio) + " required=" + toString(DEFAULT_COLLATERAL_RATIO))
+      else {
+        # Update vault liability
+        let assetSupply = getAssetSupply(synthId) + debtAmount
+        let assetLiability = fraction(assetSupply, markPrice, SCALE8)
+        let totalLiability = getTotalLiabilityValue() + fraction(debtAmount, markPrice, SCALE8)
+        let totalBacking = getTotalBackingValue() + collateralAmount
+        let newGlobalRatio = computeBackingRatio(totalBacking, totalLiability)
+
+        let count = getInteger(this, keyPositionsCount()).valueOrElse(0)
+        let userCount = getInteger(this, keyUserPositionCount(callerStr)).valueOrElse(0)
+
+        [
+          StringEntry(keyPositionOwner(positionId), callerStr),
+          StringEntry(keyPositionSynthId(positionId), synthId),
+          IntegerEntry(keyPositionCollateral(positionId), collateralAmount),
+          StringEntry(keyPositionCollateralAsset(positionId), "DUSD"),
+          IntegerEntry(keyPositionDebt(positionId), debtAmount),
+          IntegerEntry(keyPositionRatio(positionId), ratio),
+          IntegerEntry(keyPositionStatus(positionId), POS_ACTIVE),
+          IntegerEntry(keyPositionCreatedAt(positionId), lastBlock.timestamp),
+          IntegerEntry(keyPositionUpdatedAt(positionId), lastBlock.timestamp),
+          IntegerEntry(keyAssetSupply(synthId), assetSupply),
+          IntegerEntry(keyAssetLiability(synthId), assetLiability),
+          IntegerEntry(keyTotalLiabilityValue(), totalLiability),
+          IntegerEntry(keyTotalBackingValue(), totalBacking),
+          IntegerEntry(keyBackingRatio(), newGlobalRatio),
+          IntegerEntry(keyPositionsCount(), count + 1),
+          IntegerEntry(keyUserPositionCount(callerStr), userCount + 1)
+        ]
+      }
+    }
+  }
+}
+
+# ===========================================================================
+# @Callable: addCollateral — Top up position collateral
+# ===========================================================================
+
+@Callable(i)
+func addCollateral(positionId: String) = {
+  let status = getPositionStatus(positionId)
+  if (status != POS_ACTIVE) then throw("Position not active")
+  else {
+    let owner = getStringValue(this, keyPositionOwner(positionId))
+    let callerStr = toBase58String(i.caller.bytes)
+    if (callerStr != owner) then throw("Not position owner")
+    else {
+      let pmt = i.payments[0].valueOrErrorMessage("Must attach collateral")
+      let currentCollateral = getPositionCollateral(positionId)
+      let newCollateral = currentCollateral + pmt.amount
+      let debt = getPositionDebt(positionId)
+      let synthId = getStringValue(this, keyPositionSynthId(positionId))
+      let markPrice = getAssetMarkPrice(synthId)
+      let newRatio = computeRatio(newCollateral, debt, markPrice)
+
+      let totalBacking = getTotalBackingValue() + pmt.amount
+      let totalLiability = getTotalLiabilityValue()
+      let newGlobalRatio = computeBackingRatio(totalBacking, totalLiability)
+
+      [
+        IntegerEntry(keyPositionCollateral(positionId), newCollateral),
+        IntegerEntry(keyPositionRatio(positionId), newRatio),
+        IntegerEntry(keyPositionUpdatedAt(positionId), lastBlock.timestamp),
+        IntegerEntry(keyTotalBackingValue(), totalBacking),
+        IntegerEntry(keyBackingRatio(), newGlobalRatio)
+      ]
+    }
+  }
+}
+
+# ===========================================================================
+# @Callable: closePosition — User repays debt and withdraws collateral
+# ===========================================================================
+
+@Callable(i)
+func closePosition(positionId: String) = {
+  let status = getPositionStatus(positionId)
+  if (status != POS_ACTIVE) then throw("Position not active")
+  else {
+    let owner = getStringValue(this, keyPositionOwner(positionId))
+    let callerStr = toBase58String(i.caller.bytes)
+    if (callerStr != owner) then throw("Not position owner")
+    else {
+      let collateral = getPositionCollateral(positionId)
+      let debt = getPositionDebt(positionId)
+      let synthId = getStringValue(this, keyPositionSynthId(positionId))
+      let markPrice = getAssetMarkPrice(synthId)
+
+      # User must have burned the corresponding synthetic tokens already
+      # (handled by the off-chain service calling Factory.burn first)
+
+      let debtValue = fraction(debt, markPrice, SCALE8)
+      let assetSupply = getAssetSupply(synthId) - debt
+      let assetLiability = fraction(assetSupply, markPrice, SCALE8)
+      let totalLiability = getTotalLiabilityValue() - debtValue
+      let totalBacking = getTotalBackingValue() - collateral
+      let newGlobalRatio = computeBackingRatio(totalBacking, totalLiability)
+
+      [
+        IntegerEntry(keyPositionCollateral(positionId), 0),
+        IntegerEntry(keyPositionDebt(positionId), 0),
+        IntegerEntry(keyPositionRatio(positionId), 0),
+        IntegerEntry(keyPositionStatus(positionId), POS_CLOSED),
+        IntegerEntry(keyPositionUpdatedAt(positionId), lastBlock.timestamp),
+        IntegerEntry(keyAssetSupply(synthId), assetSupply),
+        IntegerEntry(keyAssetLiability(synthId), assetLiability),
+        IntegerEntry(keyTotalLiabilityValue(), totalLiability),
+        IntegerEntry(keyTotalBackingValue(), totalBacking),
+        IntegerEntry(keyBackingRatio(), newGlobalRatio),
+        ScriptTransfer(i.caller, collateral, unit)
+      ]
+    }
+  }
+}
+
+# ===========================================================================
+# @Callable: updateMarkPrice — Oracle price update
+# ===========================================================================
+
+@Callable(i)
+func updateMarkPrice(synthId: String, newPrice: Int) = {
+  strict adminCheck = requireVaultAdmin(i.caller)
+
+  if (newPrice <= 0) then throw("Price must be positive")
+  else {
+    let supply = getAssetSupply(synthId)
+    let newLiability = fraction(supply, newPrice, SCALE8)
+    let oldLiability = getInteger(this, keyAssetLiability(synthId)).valueOrElse(0)
+    let liabilityDelta = newLiability - oldLiability
+
+    let totalLiability = getTotalLiabilityValue() + liabilityDelta
+    let totalBacking = getTotalBackingValue()
+    let newRatio = computeBackingRatio(totalBacking, totalLiability)
+
+    [
+      IntegerEntry(keyAssetMarkPrice(synthId), newPrice),
+      IntegerEntry(keyAssetLiability(synthId), newLiability),
+      IntegerEntry(keyTotalLiabilityValue(), totalLiability),
+      IntegerEntry(keyBackingRatio(), newRatio)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: recordMint — Update vault accounting after mint
+# ===========================================================================
+
+@Callable(i)
+func recordMint(synthId: String, amount: Int, markPrice: Int) = {
+  strict mintCheck = requireMintRole(i.caller)
+  strict pauseCheck = requireVaultNotPaused()
+
+  let newSupply = getAssetSupply(synthId) + amount
+  let newLiability = fraction(newSupply, markPrice, SCALE8)
+  let oldLiability = getInteger(this, keyAssetLiability(synthId)).valueOrElse(0)
+  let liabilityDelta = newLiability - oldLiability
+  let totalLiability = getTotalLiabilityValue() + liabilityDelta
+  let totalBacking = getTotalBackingValue()
+  let newRatio = computeBackingRatio(totalBacking, totalLiability)
+
+  [
+    IntegerEntry(keyAssetSupply(synthId), newSupply),
+    IntegerEntry(keyAssetMarkPrice(synthId), markPrice),
+    IntegerEntry(keyAssetLiability(synthId), newLiability),
+    IntegerEntry(keyTotalLiabilityValue(), totalLiability),
+    IntegerEntry(keyBackingRatio(), newRatio)
+  ]
+}
+
+# ===========================================================================
+# @Callable: recordBurn — Update vault accounting after burn
+# ===========================================================================
+
+@Callable(i)
+func recordBurn(synthId: String, amount: Int, markPrice: Int) = {
+  strict mintCheck = requireMintRole(i.caller)
+
+  let currentSupply = getAssetSupply(synthId)
+  if (amount > currentSupply) then throw("Cannot burn more than supply")
+  else {
+    let newSupply = currentSupply - amount
+    let newLiability = fraction(newSupply, markPrice, SCALE8)
+    let oldLiability = getInteger(this, keyAssetLiability(synthId)).valueOrElse(0)
+    let liabilityDelta = newLiability - oldLiability
+    let totalLiability = getTotalLiabilityValue() + liabilityDelta
+    let totalBacking = getTotalBackingValue()
+    let newRatio = computeBackingRatio(totalBacking, totalLiability)
+
+    [
+      IntegerEntry(keyAssetSupply(synthId), newSupply),
+      IntegerEntry(keyAssetMarkPrice(synthId), markPrice),
+      IntegerEntry(keyAssetLiability(synthId), newLiability),
+      IntegerEntry(keyTotalLiabilityValue(), totalLiability),
+      IntegerEntry(keyBackingRatio(), newRatio)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: setLiquidationConfig
+# ===========================================================================
+
+@Callable(i)
+func setLiquidationConfig(synthId: String, threshold: Int, bonus: Int) = {
+  strict adminCheck = requireVaultAdmin(i.caller)
+
+  if (threshold < SCALE8) then throw("Threshold must be >= 100%")
+  else if (bonus <= 0 || bonus > 20000000) then throw("Bonus must be 0-20%")
+  else {
+    [
+      IntegerEntry(keyLiquidationThreshold(synthId), threshold),
+      IntegerEntry(keyLiquidationBonus(synthId), bonus)
+    ]
+  }
+}
+
+# ===========================================================================
+# ADMIN: grant/revoke vault admin, treasury, mint roles
+# ===========================================================================
+
+@Callable(i)
+func grantVaultAdmin(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner")
+  else [BooleanEntry(keyVaultAdmin(addr), true)]
+}
+
+@Callable(i)
+func revokeVaultAdmin(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner")
+  else [BooleanEntry(keyVaultAdmin(addr), false)]
+}
+
+@Callable(i)
+func grantTreasuryRole(addr: String) = {
+  strict adminCheck = requireVaultAdmin(i.caller)
+  [BooleanEntry(keyTreasuryRole(addr), true)]
+}
+
+@Callable(i)
+func grantMintRole(addr: String) = {
+  strict adminCheck = requireVaultAdmin(i.caller)
+  [BooleanEntry(keyMintRole(addr), true)]
+}
+
+@Callable(i)
+func revokeMintRole(addr: String) = {
+  strict adminCheck = requireVaultAdmin(i.caller)
+  [BooleanEntry(keyMintRole(addr), false)]
+}
+
+@Callable(i)
+func pauseVault() = {
+  strict adminCheck = requireVaultAdmin(i.caller)
+  [BooleanEntry(keyVaultPaused(), true)]
+}
+
+@Callable(i)
+func unpauseVault() = {
+  strict adminCheck = requireVaultAdmin(i.caller)
+  [BooleanEntry(keyVaultPaused(), false)]
+}
+
+# ===========================================================================
+# READ FUNCTIONS
+# ===========================================================================
+
+@Callable(i)
+func getVaultSummary() = {
+  let totalBacking = getTotalBackingValue()
+  let totalLiability = getTotalLiabilityValue()
+  let ratio = getBackingRatio()
+  ([], toString(totalBacking) + "__" + toString(totalLiability) + "__" + toString(ratio))
+}
+
+@Callable(i)
+func getPositionInfo(positionId: String) = {
+  let collateral = getPositionCollateral(positionId)
+  let debt = getPositionDebt(positionId)
+  let status = getPositionStatus(positionId)
+  let ratio = getInteger(this, keyPositionRatio(positionId)).valueOrElse(0)
+  ([], toString(collateral) + "__" + toString(debt) + "__" + toString(ratio) + "__" + toString(status))
+}

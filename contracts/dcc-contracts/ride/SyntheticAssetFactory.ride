@@ -1,0 +1,426 @@
+# ===========================================================================
+# SyntheticAssetFactory.ride — Synthetic Token Lifecycle Manager
+# ===========================================================================
+#
+# Manages the creation, configuration, and supply of synthetic assets.
+# Mint/burn authority restricted to approved modules (Vault, AMM).
+#
+# STORAGE:
+#   synth:{id}:*           — per-asset metadata + supply
+#   synths:count           — total registered synthetics
+#   synths:list:{idx}      — enumeration by index
+#   mintAuth:{addr}        — approved minter addresses
+#
+# ACCESS CONTROL:
+#   SYNTH_ADMIN_ROLE → create, config, status changes
+#   MINT_ROLE        → mint/burn (only approved modules)
+#
+# ===========================================================================
+
+{-# STDLIB_VERSION 5 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+# ===========================================================================
+# CONSTANTS
+# ===========================================================================
+
+let SEPARATOR = "__"
+
+# Synthetic asset statuses
+let STATUS_ACTIVE    = 0
+let STATUS_PAUSED    = 1
+let STATUS_WIND_DOWN = 2   # no new mints; only burns/redemptions
+let STATUS_DISABLED  = 3
+
+# Backing models
+let MODEL_INVENTORY_BACKED   = 0
+let MODEL_OVERCOLLATERALIZED = 1
+let MODEL_ALGORITHMIC        = 2
+
+# Fixed-point scale (8 decimals)
+let SCALE8 = 100000000
+
+# ===========================================================================
+# KEY HELPERS
+# ===========================================================================
+
+func keySynthSymbol(synthId: String)            = "synth:" + synthId + ":symbol"
+func keySynthName(synthId: String)              = "synth:" + synthId + ":name"
+func keySynthUnderlying(synthId: String)        = "synth:" + synthId + ":underlying"
+func keySynthDecimals(synthId: String)          = "synth:" + synthId + ":decimals"
+func keySynthDccTokenId(synthId: String)        = "synth:" + synthId + ":dccTokenId"
+func keySynthBackingModel(synthId: String)      = "synth:" + synthId + ":backingModel"
+func keySynthBackingAsset(synthId: String)      = "synth:" + synthId + ":backingAsset"
+func keySynthTargetBacking(synthId: String)     = "synth:" + synthId + ":targetBackingRatio"
+func keySynthTotalSupply(synthId: String)       = "synth:" + synthId + ":totalSupply"
+func keySynthSupplyCap(synthId: String)         = "synth:" + synthId + ":supplyCap"
+func keySynthIsRedeemable(synthId: String)      = "synth:" + synthId + ":isRedeemable"
+func keySynthStatus(synthId: String)            = "synth:" + synthId + ":status"
+func keySynthOracleCount(synthId: String)       = "synth:" + synthId + ":oracleCount"
+func keySynthOracleSource(synthId: String, idx: Int) = "synth:" + synthId + ":oracle:" + toString(idx)
+func keySynthRiskTier(synthId: String)          = "synth:" + synthId + ":riskTier"
+func keySynthCreatedAt(synthId: String)         = "synth:" + synthId + ":createdAt"
+
+func keySynthsCount()                           = "synths:count"
+func keySynthsList(idx: Int)                    = "synths:list:" + toString(idx)
+
+func keyMintAuth(addr: String)                  = "mintAuth:" + addr
+func keyAdminRole(addr: String)                 = "admin:" + addr
+func keyPaused()                                = "global:paused"
+
+# ===========================================================================
+# READ HELPERS
+# ===========================================================================
+
+func getSynthStatus(synthId: String) = {
+  getInteger(this, keySynthStatus(synthId)).valueOrElse(-1)
+}
+
+func getSynthTotalSupply(synthId: String) = {
+  getInteger(this, keySynthTotalSupply(synthId)).valueOrElse(0)
+}
+
+func getSynthSupplyCap(synthId: String) = {
+  getInteger(this, keySynthSupplyCap(synthId)).valueOrElse(0)
+}
+
+func getSynthsCount() = {
+  getInteger(this, keySynthsCount()).valueOrElse(0)
+}
+
+func isMintAuthorized(addr: String) = {
+  getBoolean(this, keyMintAuth(addr)).valueOrElse(false)
+}
+
+func isAdmin(addr: String) = {
+  getBoolean(this, keyAdminRole(addr)).valueOrElse(false)
+}
+
+func isPaused() = {
+  getBoolean(this, keyPaused()).valueOrElse(false)
+}
+
+# ===========================================================================
+# VALIDATION HELPERS
+# ===========================================================================
+
+func requireAdmin(caller: Address) = {
+  let callerStr = toBase58String(caller.bytes)
+  if (!isAdmin(callerStr) && caller != this) then
+    throw("Only admin or contract owner")
+  else true
+}
+
+func requireMintAuth(caller: Address) = {
+  let callerStr = toBase58String(caller.bytes)
+  if (!isMintAuthorized(callerStr)) then
+    throw("Not authorized to mint/burn")
+  else true
+}
+
+func requireNotPaused() = {
+  if (isPaused()) then throw("Contract is paused")
+  else true
+}
+
+func requireSynthExists(synthId: String) = {
+  if (getSynthStatus(synthId) < 0) then
+    throw("Synthetic asset not found: " + synthId)
+  else true
+}
+
+func requireSynthActive(synthId: String) = {
+  let status = getSynthStatus(synthId)
+  if (status != STATUS_ACTIVE) then
+    throw("Synthetic not active (status=" + toString(status) + ")")
+  else true
+}
+
+func requireSynthMintable(synthId: String) = {
+  let status = getSynthStatus(synthId)
+  if (status != STATUS_ACTIVE) then
+    throw("Cannot mint: synthetic not active (status=" + toString(status) + ")")
+  else true
+}
+
+func requireSynthBurnable(synthId: String) = {
+  let status = getSynthStatus(synthId)
+  if (status == STATUS_DISABLED) then
+    throw("Cannot burn: synthetic is disabled")
+  else true
+}
+
+# ===========================================================================
+# @Callable: createSyntheticAsset
+# ===========================================================================
+#
+# Register a new synthetic asset. Called by admin.
+# Does NOT issue tokens — just sets up configuration.
+# Token issuance happens via Issue transaction in the same invocation.
+#
+@Callable(i)
+func createSyntheticAsset(
+  synthId: String,
+  symbol: String,
+  name: String,
+  underlyingAssetId: String,
+  decimals: Int,
+  backingModel: Int,
+  backingAssetId: String,
+  targetBackingRatio: Int,
+  supplyCap: Int,
+  isRedeemable: Boolean,
+  riskTier: String
+) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict pauseCheck = requireNotPaused()
+
+  # Ensure no duplicate
+  if (getSynthStatus(synthId) >= 0) then throw("Synthetic already exists: " + synthId)
+  else if (decimals < 0 || decimals > 18) then throw("Invalid decimals")
+  else if (backingModel < 0 || backingModel > 2) then throw("Invalid backing model")
+  else if (supplyCap <= 0) then throw("Supply cap must be positive")
+  else if (targetBackingRatio < SCALE8) then throw("Target backing ratio must be >= 100%")
+  else {
+    # Issue the synthetic token on-chain
+    let issue = Issue(symbol, name + " synthetic asset on DCC", 0, decimals, true)
+    let tokenId = calculateAssetId(issue)
+    let tokenIdStr = toBase58String(tokenId)
+
+    let count = getSynthsCount()
+
+    [
+      issue,
+      StringEntry(keySynthSymbol(synthId), symbol),
+      StringEntry(keySynthName(synthId), name),
+      StringEntry(keySynthUnderlying(synthId), underlyingAssetId),
+      IntegerEntry(keySynthDecimals(synthId), decimals),
+      StringEntry(keySynthDccTokenId(synthId), tokenIdStr),
+      IntegerEntry(keySynthBackingModel(synthId), backingModel),
+      StringEntry(keySynthBackingAsset(synthId), backingAssetId),
+      IntegerEntry(keySynthTargetBacking(synthId), targetBackingRatio),
+      IntegerEntry(keySynthTotalSupply(synthId), 0),
+      IntegerEntry(keySynthSupplyCap(synthId), supplyCap),
+      BooleanEntry(keySynthIsRedeemable(synthId), isRedeemable),
+      IntegerEntry(keySynthStatus(synthId), STATUS_ACTIVE),
+      StringEntry(keySynthRiskTier(synthId), riskTier),
+      IntegerEntry(keySynthOracleCount(synthId), 0),
+      IntegerEntry(keySynthCreatedAt(synthId), lastBlock.timestamp),
+      IntegerEntry(keySynthsCount(), count + 1),
+      StringEntry(keySynthsList(count), synthId)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: updateSyntheticConfig
+# ===========================================================================
+
+@Callable(i)
+func updateSyntheticConfig(
+  synthId: String,
+  newSupplyCap: Int,
+  newTargetBackingRatio: Int,
+  newIsRedeemable: Boolean
+) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict existsCheck = requireSynthExists(synthId)
+
+  if (newSupplyCap <= 0) then throw("Supply cap must be positive")
+  else if (newTargetBackingRatio < SCALE8) then throw("Target backing ratio must be >= 100%")
+  else {
+    [
+      IntegerEntry(keySynthSupplyCap(synthId), newSupplyCap),
+      IntegerEntry(keySynthTargetBacking(synthId), newTargetBackingRatio),
+      BooleanEntry(keySynthIsRedeemable(synthId), newIsRedeemable)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: setStatus
+# ===========================================================================
+
+@Callable(i)
+func setStatus(synthId: String, newStatus: Int) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict existsCheck = requireSynthExists(synthId)
+
+  if (newStatus < 0 || newStatus > 3) then throw("Invalid status")
+  else {
+    let oldStatus = getSynthStatus(synthId)
+    [
+      IntegerEntry(keySynthStatus(synthId), newStatus)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: addOracleSource
+# ===========================================================================
+
+@Callable(i)
+func addOracleSource(
+  synthId: String,
+  sourceId: String,
+  venueId: String,
+  weight: Int,
+  maxStalenessMs: Int
+) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict existsCheck = requireSynthExists(synthId)
+
+  if (weight <= 0 || weight > SCALE8) then throw("Invalid weight")
+  else if (maxStalenessMs <= 0) then throw("Invalid staleness")
+  else {
+    let count = getInteger(this, keySynthOracleCount(synthId)).valueOrElse(0)
+    let data = sourceId + SEPARATOR + venueId + SEPARATOR + toString(weight) + SEPARATOR + toString(maxStalenessMs)
+    [
+      StringEntry(keySynthOracleSource(synthId, count), data),
+      IntegerEntry(keySynthOracleCount(synthId), count + 1)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: mint — Mint synthetic tokens
+# ===========================================================================
+#
+# Only callable by authorized modules (Vault, AMM).
+# Enforces supply cap. Reissues tokens from the wave Issue.
+#
+@Callable(i)
+func mint(synthId: String, recipient: String, amount: Int) = {
+  strict mintCheck = requireMintAuth(i.caller)
+  strict pauseCheck = requireNotPaused()
+  strict mintable = requireSynthMintable(synthId)
+
+  if (amount <= 0) then throw("Amount must be positive")
+  else {
+    let currentSupply = getSynthTotalSupply(synthId)
+    let cap = getSynthSupplyCap(synthId)
+    let newSupply = currentSupply + amount
+
+    if (newSupply > cap) then
+      throw("Supply cap exceeded: " + toString(newSupply) + " > " + toString(cap))
+    else {
+      let tokenIdStr = getStringValue(this, keySynthDccTokenId(synthId))
+      let tokenId = fromBase58String(tokenIdStr)
+      let recipientAddr = addressFromStringValue(recipient)
+
+      [
+        Reissue(tokenId, amount, true),
+        ScriptTransfer(recipientAddr, amount, tokenId),
+        IntegerEntry(keySynthTotalSupply(synthId), newSupply)
+      ]
+    }
+  }
+}
+
+# ===========================================================================
+# @Callable: burn — Burn synthetic tokens
+# ===========================================================================
+#
+# Only callable by authorized modules.
+# Caller must attach the synthetic tokens as payment.
+#
+@Callable(i)
+func burn(synthId: String, amount: Int) = {
+  strict mintCheck = requireMintAuth(i.caller)
+  strict burnable = requireSynthBurnable(synthId)
+
+  if (amount <= 0) then throw("Amount must be positive")
+  else {
+    let tokenIdStr = getStringValue(this, keySynthDccTokenId(synthId))
+    let tokenId = fromBase58String(tokenIdStr)
+
+    # Verify payment
+    let pmt = i.payments[0].valueOrErrorMessage("Must attach synthetic tokens")
+    if (pmt.assetId != tokenId) then throw("Wrong asset attached")
+    else if (pmt.amount != amount) then throw("Payment amount mismatch")
+    else {
+      let currentSupply = getSynthTotalSupply(synthId)
+      let newSupply = currentSupply - amount
+
+      if (newSupply < 0) then throw("Cannot burn more than supply")
+      else {
+        [
+          Burn(tokenId, amount),
+          IntegerEntry(keySynthTotalSupply(synthId), newSupply)
+        ]
+      }
+    }
+  }
+}
+
+# ===========================================================================
+# @Callable: grantMintAuth / revokeMintAuth
+# ===========================================================================
+
+@Callable(i)
+func grantMintAuth(moduleAddress: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [
+    BooleanEntry(keyMintAuth(moduleAddress), true)
+  ]
+}
+
+@Callable(i)
+func revokeMintAuth(moduleAddress: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [
+    BooleanEntry(keyMintAuth(moduleAddress), false)
+  ]
+}
+
+# ===========================================================================
+# @Callable: grantAdmin / revokeAdmin
+# ===========================================================================
+
+@Callable(i)
+func grantAdmin(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner")
+  else [BooleanEntry(keyAdminRole(addr), true)]
+}
+
+@Callable(i)
+func revokeAdmin(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner")
+  else [BooleanEntry(keyAdminRole(addr), false)]
+}
+
+# ===========================================================================
+# @Callable: pause / unpause
+# ===========================================================================
+
+@Callable(i)
+func pause() = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyPaused(), true)]
+}
+
+@Callable(i)
+func unpause() = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyPaused(), false)]
+}
+
+# ===========================================================================
+# READ FUNCTIONS
+# ===========================================================================
+
+@Callable(i)
+func getSyntheticInfo(synthId: String) = {
+  strict existsCheck = requireSynthExists(synthId)
+  let symbol = getStringValue(this, keySynthSymbol(synthId))
+  let supply = getSynthTotalSupply(synthId)
+  let cap = getSynthSupplyCap(synthId)
+  let status = getSynthStatus(synthId)
+  ([], (symbol + SEPARATOR + toString(supply) + SEPARATOR + toString(cap) + SEPARATOR + toString(status)))
+}
+
+@Callable(i)
+func getSynthCount() = {
+  ([], getSynthsCount())
+}

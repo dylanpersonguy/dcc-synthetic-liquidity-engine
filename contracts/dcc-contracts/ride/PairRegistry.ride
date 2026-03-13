@@ -1,0 +1,304 @@
+# ===========================================================================
+# PairRegistry.ride — Canonical Pair Registry
+# ===========================================================================
+#
+# The canonical registry of all tradeable pairs on DCC.
+# Every market resolution — quote, route, execution — begins by looking up
+# pair metadata from this contract.
+#
+# STORAGE:
+#   pair:{pairId}:*            — per-pair metadata
+#   pairs:count                — total registered pairs
+#   pairs:list:{idx}           — enumeration by index
+#   extSource:{pairId}:{venueId} — external venue linkage
+#
+# ACCESS CONTROL:
+#   ADMIN_ROLE    → registerPair, config, status, linkExternalSource
+#   OPERATOR_ROLE → setPairStatus (to PAUSED only)
+#
+# ===========================================================================
+
+{-# STDLIB_VERSION 5 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+# ===========================================================================
+# CONSTANTS
+# ===========================================================================
+
+let SEPARATOR = "__"
+
+# Market modes
+let MODE_NATIVE     = 0
+let MODE_SYNTHETIC  = 1
+let MODE_TELEPORT   = 2
+let MODE_REDEEMABLE = 3
+
+# Market statuses
+let STATUS_ACTIVE     = 0
+let STATUS_QUOTE_ONLY = 1
+let STATUS_PAUSED     = 2
+let STATUS_DISABLED   = 3
+
+# ===========================================================================
+# KEY HELPERS
+# ===========================================================================
+
+func keyPairBase(pairId: String)              = "pair:" + pairId + ":base"
+func keyPairQuote(pairId: String)             = "pair:" + pairId + ":quote"
+func keyPairMode(pairId: String)              = "pair:" + pairId + ":mode"
+func keyPairStatus(pairId: String)            = "pair:" + pairId + ":status"
+func keyPairRiskTier(pairId: String)          = "pair:" + pairId + ":riskTier"
+func keyPairLocalPoolId(pairId: String)       = "pair:" + pairId + ":localPoolId"
+func keyPairLocalBookId(pairId: String)       = "pair:" + pairId + ":localBookId"
+func keyPairSynthAssetId(pairId: String)      = "pair:" + pairId + ":synthAssetId"
+func keyPairMaxTradeSize(pairId: String)      = "pair:" + pairId + ":maxTradeSize"
+func keyPairMaxDailyVolume(pairId: String)    = "pair:" + pairId + ":maxDailyVolume"
+func keyPairCreatedAt(pairId: String)         = "pair:" + pairId + ":createdAt"
+func keyPairUpdatedAt(pairId: String)         = "pair:" + pairId + ":updatedAt"
+func keyPairsCount()                          = "pairs:count"
+func keyPairsList(idx: Int)                   = "pairs:list:" + toString(idx)
+func keyExtSource(pairId: String, venueId: String) = "extSource:" + pairId + ":" + venueId
+func keyAdminRole(addr: String)               = "admin:" + addr
+func keyOperatorRole(addr: String)            = "operator:" + addr
+func keyPaused()                              = "global:paused"
+
+# ===========================================================================
+# READ HELPERS
+# ===========================================================================
+
+func getPairStatus(pairId: String) = {
+  getInteger(this, keyPairStatus(pairId)).valueOrElse(-1)
+}
+
+func getPairsCount() = {
+  getInteger(this, keyPairsCount()).valueOrElse(0)
+}
+
+func isAdmin(addr: String) = {
+  getBoolean(this, keyAdminRole(addr)).valueOrElse(false)
+}
+
+func isOperator(addr: String) = {
+  getBoolean(this, keyOperatorRole(addr)).valueOrElse(false)
+}
+
+func isPaused() = {
+  getBoolean(this, keyPaused()).valueOrElse(false)
+}
+
+# ===========================================================================
+# VALIDATION HELPERS
+# ===========================================================================
+
+func requireAdmin(caller: Address) = {
+  let callerStr = toBase58String(caller.bytes)
+  if (!isAdmin(callerStr) && caller != this) then
+    throw("Only admin or contract owner")
+  else true
+}
+
+func requireAdminOrOperator(caller: Address) = {
+  let callerStr = toBase58String(caller.bytes)
+  if (!isAdmin(callerStr) && !isOperator(callerStr) && caller != this) then
+    throw("Only admin/operator or contract owner")
+  else true
+}
+
+func requireNotPaused() = {
+  if (isPaused()) then throw("Contract is paused")
+  else true
+}
+
+func requirePairExists(pairId: String) = {
+  if (getPairStatus(pairId) < 0) then
+    throw("Pair not found: " + pairId)
+  else true
+}
+
+# ===========================================================================
+# @Callable: registerPair
+# ===========================================================================
+
+@Callable(i)
+func registerPair(
+  pairId: String,
+  baseAssetId: String,
+  quoteAssetId: String,
+  mode: Int,
+  riskTier: String,
+  maxTradeSize: Int,
+  maxDailyVolume: Int
+) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict pauseCheck = requireNotPaused()
+
+  if (getPairStatus(pairId) >= 0) then throw("Pair already exists: " + pairId)
+  else if (mode < 0 || mode > 3) then throw("Invalid mode")
+  else if (maxTradeSize <= 0) then throw("maxTradeSize must be positive")
+  else if (maxDailyVolume <= 0) then throw("maxDailyVolume must be positive")
+  else {
+    let count = getPairsCount()
+
+    [
+      StringEntry(keyPairBase(pairId), baseAssetId),
+      StringEntry(keyPairQuote(pairId), quoteAssetId),
+      IntegerEntry(keyPairMode(pairId), mode),
+      IntegerEntry(keyPairStatus(pairId), STATUS_ACTIVE),
+      StringEntry(keyPairRiskTier(pairId), riskTier),
+      IntegerEntry(keyPairMaxTradeSize(pairId), maxTradeSize),
+      IntegerEntry(keyPairMaxDailyVolume(pairId), maxDailyVolume),
+      IntegerEntry(keyPairCreatedAt(pairId), lastBlock.timestamp),
+      IntegerEntry(keyPairUpdatedAt(pairId), lastBlock.timestamp),
+      IntegerEntry(keyPairsCount(), count + 1),
+      StringEntry(keyPairsList(count), pairId)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: updatePairConfig
+# ===========================================================================
+
+@Callable(i)
+func updatePairConfig(
+  pairId: String,
+  newMode: Int,
+  newRiskTier: String,
+  newMaxTradeSize: Int,
+  newMaxDailyVolume: Int
+) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict existsCheck = requirePairExists(pairId)
+
+  if (newMode < 0 || newMode > 3) then throw("Invalid mode")
+  else if (newMaxTradeSize <= 0) then throw("maxTradeSize must be positive")
+  else {
+    [
+      IntegerEntry(keyPairMode(pairId), newMode),
+      StringEntry(keyPairRiskTier(pairId), newRiskTier),
+      IntegerEntry(keyPairMaxTradeSize(pairId), newMaxTradeSize),
+      IntegerEntry(keyPairMaxDailyVolume(pairId), newMaxDailyVolume),
+      IntegerEntry(keyPairUpdatedAt(pairId), lastBlock.timestamp)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: setPairStatus
+# ===========================================================================
+
+@Callable(i)
+func setPairStatus(pairId: String, newStatus: Int) = {
+  strict existsCheck = requirePairExists(pairId)
+
+  let callerStr = toBase58String(i.caller.bytes)
+  let callerIsAdmin = isAdmin(callerStr) || i.caller == this
+  let callerIsOperator = isOperator(callerStr)
+
+  if (!callerIsAdmin && !callerIsOperator) then throw("Not authorized")
+  else if (!callerIsAdmin && newStatus != STATUS_PAUSED) then throw("Operator can only pause")
+  else if (newStatus < 0 || newStatus > 3) then throw("Invalid status")
+  else {
+    [
+      IntegerEntry(keyPairStatus(pairId), newStatus),
+      IntegerEntry(keyPairUpdatedAt(pairId), lastBlock.timestamp)
+    ]
+  }
+}
+
+# ===========================================================================
+# @Callable: linkPoolToPair / linkSynthToPair
+# ===========================================================================
+
+@Callable(i)
+func linkPoolToPair(pairId: String, poolId: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict existsCheck = requirePairExists(pairId)
+  [
+    StringEntry(keyPairLocalPoolId(pairId), poolId),
+    IntegerEntry(keyPairUpdatedAt(pairId), lastBlock.timestamp)
+  ]
+}
+
+@Callable(i)
+func linkSynthToPair(pairId: String, synthAssetId: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict existsCheck = requirePairExists(pairId)
+  [
+    StringEntry(keyPairSynthAssetId(pairId), synthAssetId),
+    IntegerEntry(keyPairUpdatedAt(pairId), lastBlock.timestamp)
+  ]
+}
+
+# ===========================================================================
+# @Callable: linkExternalSource / toggleExternalSource
+# ===========================================================================
+
+@Callable(i)
+func linkExternalSource(pairId: String, venueId: String, venuePairId: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict existsCheck = requirePairExists(pairId)
+  [
+    StringEntry(keyExtSource(pairId, venueId), venuePairId + SEPARATOR + "true"),
+    IntegerEntry(keyPairUpdatedAt(pairId), lastBlock.timestamp)
+  ]
+}
+
+@Callable(i)
+func toggleExternalSource(pairId: String, venueId: String, enabled: Boolean) = {
+  strict adminCheck = requireAdmin(i.caller)
+  strict existsCheck = requirePairExists(pairId)
+
+  let existing = getStringValue(this, keyExtSource(pairId, venueId))
+  let parts = existing.split(SEPARATOR)
+  let venuePairId = parts[0]
+  [
+    StringEntry(keyExtSource(pairId, venueId), venuePairId + SEPARATOR + toString(enabled)),
+    IntegerEntry(keyPairUpdatedAt(pairId), lastBlock.timestamp)
+  ]
+}
+
+# ===========================================================================
+# @Callable: grantAdmin / revokeAdmin / grantOperator / revokeOperator
+# ===========================================================================
+
+@Callable(i)
+func grantAdmin(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner")
+  else [BooleanEntry(keyAdminRole(addr), true)]
+}
+
+@Callable(i)
+func revokeAdmin(addr: String) = {
+  if (i.caller != this) then throw("Only contract owner")
+  else [BooleanEntry(keyAdminRole(addr), false)]
+}
+
+@Callable(i)
+func grantOperator(addr: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyOperatorRole(addr), true)]
+}
+
+@Callable(i)
+func revokeOperator(addr: String) = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyOperatorRole(addr), false)]
+}
+
+# ===========================================================================
+# @Callable: pause / unpause
+# ===========================================================================
+
+@Callable(i)
+func pause() = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyPaused(), true)]
+}
+
+@Callable(i)
+func unpause() = {
+  strict adminCheck = requireAdmin(i.caller)
+  [BooleanEntry(keyPaused(), false)]
+}
